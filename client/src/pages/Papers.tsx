@@ -1,7 +1,7 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef, type DragEvent } from "react";
 import { useParams, Link } from "wouter";
 import { motion } from "framer-motion";
-import { Users, FileText, Plus, Pencil, Trash2, ChevronLeft, ChevronRight, ExternalLink, Download, Eye } from "lucide-react";
+import { Users, FileText, Plus, Pencil, Trash2, ChevronLeft, ChevronRight, ExternalLink, Download, Eye, UploadCloud, X, RotateCcw } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -28,7 +28,7 @@ import {
 import Header from "@/components/Header";
 import Footer from "@/components/Footer";
 import PageHero from "@/components/PageHero";
-import { api, Paper } from "@/lib/api";
+import { api, Paper, type PaperAttachment } from "@/lib/api";
 import { useSession } from "@/hooks/use-session";
 import { toast } from "sonner";
 
@@ -53,6 +53,192 @@ const isValidWebsiteUrl = (value: string) => {
 };
 
 const ITEMS_PER_PAGE = 5;
+const MAX_ATTACHMENT_COUNT = 5;
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
+const MAX_ATTACHMENTS_TOTAL_BYTES = 30 * 1024 * 1024;
+const ATTACHMENT_EXTENSIONS = ["pdf", "doc", "docx", "hwp", "hwpx", "ppt", "pptx", "jpg", "jpeg", "png", "webp"];
+const ATTACHMENT_ACCEPT = ATTACHMENT_EXTENSIONS.map((extension) => `.${extension}`).join(",");
+
+const formatFileSize = (bytes: number) => {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(bytes >= 10 * 1024 * 1024 ? 0 : 1)} MB`;
+};
+
+const fileExtension = (fileName: string) => fileName.split(".").pop()?.toLowerCase() || "";
+
+interface AttachmentDropzoneProps {
+  files: File[];
+  onChange: (files: File[]) => void;
+  existingCount?: number;
+  existingBytes?: number;
+  disabled?: boolean;
+  id: string;
+}
+
+function AttachmentDropzone({
+  files,
+  onChange,
+  existingCount = 0,
+  existingBytes = 0,
+  disabled = false,
+  id,
+}: AttachmentDropzoneProps) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const dragDepthRef = useRef(0);
+  const [isDragging, setIsDragging] = useState(false);
+
+  useEffect(() => {
+    if (disabled) {
+      dragDepthRef.current = 0;
+      setIsDragging(false);
+    }
+  }, [disabled]);
+
+  const addFiles = (incoming: File[]) => {
+    if (disabled || incoming.length === 0) return;
+
+    const next = [...files];
+    let nextBytes = existingBytes + next.reduce((total, file) => total + file.size, 0);
+    const errors = new Set<string>();
+
+    incoming.forEach((file) => {
+      if (!ATTACHMENT_EXTENSIONS.includes(fileExtension(file.name))) {
+        errors.add("지원하지 않는 파일 형식이 포함되어 있습니다.");
+        return;
+      }
+      if (file.size === 0) {
+        errors.add("내용이 없는 파일은 첨부할 수 없습니다.");
+        return;
+      }
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        errors.add("파일 한 개의 크기는 10MB 이하여야 합니다.");
+        return;
+      }
+      if (existingCount + next.length >= MAX_ATTACHMENT_COUNT) {
+        errors.add("첨부파일은 최대 5개까지 등록할 수 있습니다.");
+        return;
+      }
+      if (nextBytes + file.size > MAX_ATTACHMENTS_TOTAL_BYTES) {
+        errors.add("첨부파일 전체 크기는 30MB 이하여야 합니다.");
+        return;
+      }
+      if (next.some((current) => current.name === file.name && current.size === file.size && current.lastModified === file.lastModified)) {
+        errors.add("같은 파일은 한 번만 첨부할 수 있습니다.");
+        return;
+      }
+      next.push(file);
+      nextBytes += file.size;
+    });
+
+    if (next.length !== files.length) onChange(next);
+    errors.forEach((message) => toast.error(message));
+  };
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    if (!event.dataTransfer.types.includes("Files")) return;
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setIsDragging(false);
+    addFiles(Array.from(event.dataTransfer.files));
+  };
+
+  return (
+    <div className="space-y-3">
+      <input
+        ref={inputRef}
+        id={id}
+        type="file"
+        className="sr-only"
+        multiple
+        accept={ATTACHMENT_ACCEPT}
+        disabled={disabled}
+        onChange={(event) => {
+          addFiles(Array.from(event.target.files || []));
+          event.target.value = "";
+        }}
+      />
+      <div
+        role="button"
+        tabIndex={disabled ? -1 : 0}
+        aria-disabled={disabled}
+        aria-describedby={`${id}-help`}
+        onClick={() => { if (!disabled) inputRef.current?.click(); }}
+        onKeyDown={(event) => {
+          if (!disabled && (event.key === "Enter" || event.key === " ")) {
+            event.preventDefault();
+            inputRef.current?.click();
+          }
+        }}
+        onDragEnter={(event) => {
+          if (!event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          dragDepthRef.current += 1;
+          if (!disabled) setIsDragging(true);
+        }}
+        onDragOver={(event) => {
+          if (!event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          if (!disabled) setIsDragging(true);
+        }}
+        onDragLeave={(event) => {
+          if (!event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+          if (dragDepthRef.current === 0) setIsDragging(false);
+        }}
+        onDrop={handleDrop}
+        className={`group flex min-h-36 cursor-pointer flex-col items-center justify-center rounded-lg border-2 border-dashed px-5 py-6 text-center outline-none transition-colors focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 ${
+          isDragging
+            ? "border-primary bg-blue-50"
+            : "border-slate-300 bg-slate-50 hover:border-primary hover:bg-blue-50/60"
+        } ${disabled ? "cursor-not-allowed opacity-60" : ""}`}
+        data-testid={`${id}-dropzone`}
+        data-drop-active={isDragging ? "true" : "false"}
+      >
+        <span className="mb-3 inline-flex h-11 w-11 items-center justify-center rounded-full bg-blue-100 text-primary transition-transform group-hover:-translate-y-0.5">
+          <UploadCloud className="h-5 w-5" aria-hidden="true" />
+        </span>
+        <p className="text-sm font-bold text-slate-800">
+          파일을 이곳에 끌어놓거나 <span className="text-primary underline underline-offset-2">직접 선택</span>하세요
+        </p>
+        <p id={`${id}-help`} className="mt-1.5 text-xs leading-5 text-slate-500">
+          PDF · Word · HWP/HWPX · PPT · JPG/PNG/WebP<br />최대 5개 · 파일당 10MB · 전체 30MB
+        </p>
+      </div>
+
+      {files.length > 0 && (
+        <div className="space-y-2">
+          <p className="text-xs font-semibold text-slate-500" aria-live="polite">
+            첨부 예정 {existingCount + files.length}/{MAX_ATTACHMENT_COUNT}개 · {formatFileSize(existingBytes + files.reduce((total, file) => total + file.size, 0))}
+          </p>
+          <ul className="space-y-2" aria-label="새 첨부파일">
+          {files.map((file, index) => (
+            <li key={`${file.name}-${file.size}-${file.lastModified}`} className="flex min-w-0 items-center gap-3 rounded-lg border border-blue-100 bg-blue-50/70 px-3 py-2.5">
+              <FileText className="h-5 w-5 shrink-0 text-primary" aria-hidden="true" />
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-semibold text-slate-800">{file.name}</p>
+                <p className="text-xs text-slate-500">{formatFileSize(file.size)}</p>
+              </div>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                disabled={disabled}
+                className="h-10 w-10 shrink-0 rounded-md text-slate-500 hover:bg-white hover:text-destructive"
+                onClick={(event) => { event.stopPropagation(); onChange(files.filter((_, fileIndex) => fileIndex !== index)); }}
+                aria-label={`${file.name} 첨부 취소`}
+              >
+                <X className="h-4 w-4" />
+              </Button>
+            </li>
+          ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
 
 export default function Papers() {
   const params = useParams<{ category?: string }>();
@@ -70,8 +256,11 @@ export default function Papers() {
   const [isEditOpen, setIsEditOpen] = useState(false);
   const [isViewOpen, setIsViewOpen] = useState(false);
   const [deleteId, setDeleteId] = useState<number | null>(null);
+  const [attachmentDeleteCandidate, setAttachmentDeleteCandidate] = useState<PaperAttachment | null>(null);
   const [editingPaper, setEditingPaper] = useState<Paper | null>(null);
   const [viewingPaper, setViewingPaper] = useState<Paper | null>(null);
+  const [newAttachments, setNewAttachments] = useState<File[]>([]);
+  const [attachmentIdsToDelete, setAttachmentIdsToDelete] = useState<number[]>([]);
   const [formData, setFormData] = useState({
     title: "",
     authors: "",
@@ -97,15 +286,37 @@ export default function Papers() {
     setCurrentPage(1);
   }, [category]);
 
+  useEffect(() => {
+    if (isAdmin) return;
+    setIsAddOpen(false);
+    setIsEditOpen(false);
+    setDeleteId(null);
+    setAttachmentDeleteCandidate(null);
+    setEditingPaper(null);
+    setNewAttachments([]);
+    setAttachmentIdsToDelete([]);
+    setSaving(false);
+    setDeleting(false);
+  }, [isAdmin]);
+
   const currentPapers = useMemo(() => {
     return papers.filter(p => normalizeCategory(p.category) === category);
   }, [papers, category]);
 
   const totalPages = Math.ceil(currentPapers.length / ITEMS_PER_PAGE);
   const displayedPapers = showAll ? currentPapers : currentPapers.slice((currentPage - 1) * ITEMS_PER_PAGE, currentPage * ITEMS_PER_PAGE);
+  const activeEditingAttachments = (editingPaper?.attachments || []).filter(
+    (attachment) => !attachmentIdsToDelete.includes(attachment.id),
+  );
+  const activeEditingAttachmentBytes = activeEditingAttachments.reduce(
+    (total, attachment) => total + attachment.byteSize,
+    0,
+  );
 
   const openAdd = () => {
     setFormData({ title: "", authors: "", websiteUrl: "" });
+    setNewAttachments([]);
+    setAttachmentIdsToDelete([]);
     setIsAddOpen(true);
   };
 
@@ -116,6 +327,8 @@ export default function Papers() {
       authors: paper.authors,
       websiteUrl: paper.websiteUrl || "",
     });
+    setNewAttachments([]);
+    setAttachmentIdsToDelete([]);
     setIsEditOpen(true);
   };
 
@@ -159,12 +372,12 @@ export default function Papers() {
         year: String(new Date().getFullYear()),
         abstract: null,
         keywords: [],
-        files: [],
         websiteUrl: formData.websiteUrl.trim() || null,
         date: new Date().toISOString().split('T')[0].replace(/-/g, '.'),
-      });
+      }, newAttachments);
       await loadPapers();
       setIsAddOpen(false);
+      setNewAttachments([]);
       toast.success("논문이 등록되었습니다.");
     } catch (e: any) {
       console.error("Failed to add paper", e);
@@ -190,14 +403,21 @@ export default function Papers() {
     }
     setSaving(true);
     try {
-      await api.papers.update(editingPaper.id, {
-        title: formData.title.trim(),
-        authors: formData.authors.trim(),
-        websiteUrl: formData.websiteUrl.trim() || null,
-      });
+      await api.papers.updateWithAttachments(
+        editingPaper.id,
+        {
+          title: formData.title.trim(),
+          authors: formData.authors.trim(),
+          websiteUrl: formData.websiteUrl.trim() || null,
+          deleteAttachmentIds: attachmentIdsToDelete,
+        },
+        newAttachments,
+      );
       await loadPapers();
       setIsEditOpen(false);
       setEditingPaper(null);
+      setNewAttachments([]);
+      setAttachmentIdsToDelete([]);
       toast.success("논문이 수정되었습니다.");
     } catch (e: any) {
       console.error("Failed to edit paper", e);
@@ -288,8 +508,21 @@ export default function Papers() {
                           <Badge variant="secondary" className="gap-1 border border-slate-200 bg-slate-100 font-semibold text-slate-600"><Eye className="h-3.5 w-3.5" />조회수 {paper.views}</Badge>
                           {paper.websiteUrl && <a href={paper.websiteUrl} target="_blank" rel="noopener noreferrer" className="text-primary flex items-center gap-1 hover:underline"><ExternalLink className="w-3.5 h-3.5" />사이트</a>}
                         </div>
-                        {paper.files && paper.files.length > 0 && (
-                          <div className="mt-3 flex flex-wrap gap-2">{paper.files.map((fileName, index) => <span key={index} className="inline-flex items-center gap-1.5 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-600"><FileText className="h-3.5 w-3.5" aria-hidden="true" />{fileName}</span>)}</div>
+                        {((paper.attachments?.length || 0) > 0 || (paper.files?.length || 0) > 0) && (
+                          <div className="mt-3 flex flex-wrap gap-2">
+                            {(paper.attachments || []).map((attachment) => (
+                              <span key={attachment.id} className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-blue-100 bg-blue-50 px-2 py-1 text-xs font-medium text-slate-700">
+                                <FileText className="h-3.5 w-3.5 shrink-0 text-primary" aria-hidden="true" />
+                                <span className="max-w-56 truncate">{attachment.fileName}</span>
+                              </span>
+                            ))}
+                            {(paper.attachments?.length || 0) === 0 && paper.files?.map((fileName, index) => (
+                              <span key={`${fileName}-${index}`} className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-600">
+                                <FileText className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                                <span className="max-w-56 truncate">{fileName}</span>
+                              </span>
+                            ))}
+                          </div>
                         )}
                       </div>
                       {isAdmin && (
@@ -330,9 +563,34 @@ export default function Papers() {
               {viewingPaper?.correspondingAuthor && <p className="text-green-600 text-base"><strong>교신저자:</strong> {viewingPaper.correspondingAuthor}</p>}
               {viewingPaper?.websiteUrl && <p className="text-base"><strong>사이트:</strong> <a href={viewingPaper.websiteUrl} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">{viewingPaper.websiteUrl}</a></p>}
             </div>
-            {viewingPaper?.files && viewingPaper.files.length > 0 && (
+            {viewingPaper?.attachments && viewingPaper.attachments.length > 0 && (
               <div className="space-y-2">
                 <Label className="font-bold text-base">첨부파일</Label>
+                <div className="space-y-2">
+                  {viewingPaper.attachments.map((attachment) => (
+                    <div key={attachment.id} className="flex min-w-0 flex-col gap-3 rounded-lg border border-blue-100 bg-blue-50/70 p-3 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex min-w-0 items-center gap-3">
+                        <span className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-white text-primary shadow-sm"><FileText className="h-5 w-5" aria-hidden="true" /></span>
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold text-slate-800">{attachment.fileName}</p>
+                          <p className="mt-0.5 text-xs text-slate-500">{formatFileSize(attachment.byteSize)}</p>
+                        </div>
+                      </div>
+                      <a
+                        href={api.papers.attachmentDownloadUrl(attachment)}
+                        download={attachment.fileName}
+                        className="inline-flex h-10 shrink-0 items-center justify-center gap-1.5 rounded-md border border-blue-200 bg-white px-3 text-sm font-bold text-primary transition-colors hover:bg-blue-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary"
+                      >
+                        <Download className="h-4 w-4" aria-hidden="true" />다운로드
+                      </a>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+            {(!viewingPaper?.attachments || viewingPaper.attachments.length === 0) && viewingPaper?.files && viewingPaper.files.length > 0 && (
+              <div className="space-y-2">
+                <Label className="font-bold text-base">기존 첨부파일</Label>
                 <div className="space-y-2">
                   {viewingPaper.files.map((fileStr, index) => {
                     const isUrl = fileStr.startsWith('/uploads/');
@@ -356,8 +614,8 @@ export default function Papers() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={isAdmin && isAddOpen} onOpenChange={(open) => { if (!saving) setIsAddOpen(open); }}>
-        <DialogContent className="max-h-[85vh] overflow-y-auto rounded-xl sm:max-w-lg" data-testid="paper-add-dialog">
+      <Dialog open={isAdmin && isAddOpen} onOpenChange={(open) => { if (!saving) { setIsAddOpen(open); if (!open) setNewAttachments([]); } }}>
+        <DialogContent className="max-h-[85vh] overflow-y-auto rounded-xl sm:max-w-2xl" data-testid="paper-add-dialog">
           <DialogHeader>
             <DialogTitle className="text-xl font-bold">등록</DialogTitle>
             <DialogDescription className="text-base">{categoryTitles[category]}에 새 논문을 등록합니다.</DialogDescription>
@@ -375,7 +633,16 @@ export default function Papers() {
               <Label htmlFor="paper-website" className="font-bold">사이트 주소 (선택)</Label>
               <Input id="paper-website" type="url" inputMode="url" placeholder="https://example.com" value={formData.websiteUrl} onChange={(e) => setFormData({ ...formData, websiteUrl: e.target.value })} className="h-12 rounded-lg text-base" />
             </div>
-            <div className="flex gap-3 pt-3">
+            <div className="space-y-2">
+              <Label htmlFor="paper-attachments" className="font-bold">첨부파일 (선택)</Label>
+              <AttachmentDropzone
+                id="paper-attachments"
+                files={newAttachments}
+                onChange={setNewAttachments}
+                disabled={saving}
+              />
+            </div>
+            <div className="sticky bottom-0 z-20 -mx-6 -mb-6 flex gap-3 border-t border-slate-200 bg-white px-6 pb-6 pt-4 shadow-[0_-8px_20px_rgba(15,23,42,0.06)]">
               <Button type="button" variant="outline" onClick={() => setIsAddOpen(false)} disabled={saving} className="h-12 flex-1 rounded-lg text-base">취소</Button>
               <Button type="submit" disabled={saving} className="h-12 flex-1 rounded-lg bg-gradient-to-r from-primary to-blue-600 text-base font-bold" data-testid="paper-submit">{saving ? "등록 중..." : "등록"}</Button>
             </div>
@@ -383,20 +650,85 @@ export default function Papers() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={isAdmin && isEditOpen} onOpenChange={(open) => { if (!saving) setIsEditOpen(open); }}>
-        <DialogContent className="max-h-[85vh] overflow-y-auto rounded-xl sm:max-w-lg">
-          <DialogHeader><DialogTitle className="text-xl font-bold">논문 수정</DialogTitle><DialogDescription>논문 제목, 저자와 사이트 주소를 수정합니다.</DialogDescription></DialogHeader>
+      <Dialog open={isAdmin && isEditOpen} onOpenChange={(open) => { if (!saving) { setIsEditOpen(open); if (!open) { setNewAttachments([]); setAttachmentIdsToDelete([]); setEditingPaper(null); } } }}>
+        <DialogContent className="max-h-[85vh] overflow-y-auto rounded-xl sm:max-w-2xl">
+          <DialogHeader><DialogTitle className="text-xl font-bold">논문 수정</DialogTitle><DialogDescription>논문 정보와 첨부파일을 수정합니다.</DialogDescription></DialogHeader>
           <form className="mt-4 space-y-5" onSubmit={(event) => { event.preventDefault(); void handleEdit(); }}>
             <div className="space-y-2"><Label htmlFor="edit-paper-title" className="font-bold">논문 제목</Label><Input id="edit-paper-title" value={formData.title} onChange={(e) => setFormData({ ...formData, title: e.target.value })} className="h-12 rounded-lg text-base" /></div>
             <div className="space-y-2"><Label htmlFor="edit-paper-authors" className="font-bold">저자</Label><Input id="edit-paper-authors" value={formData.authors} onChange={(e) => setFormData({ ...formData, authors: e.target.value })} className="h-12 rounded-lg text-base" /></div>
             <div className="space-y-2"><Label htmlFor="edit-paper-website" className="font-bold">사이트 주소 (선택)</Label><Input id="edit-paper-website" type="url" inputMode="url" value={formData.websiteUrl} onChange={(e) => setFormData({ ...formData, websiteUrl: e.target.value })} className="h-12 rounded-lg text-base" /></div>
-            <div className="flex gap-3 pt-3"><Button type="button" variant="outline" onClick={() => setIsEditOpen(false)} disabled={saving} className="h-12 flex-1 rounded-lg text-base">취소</Button><Button type="submit" disabled={saving} className="h-12 flex-1 rounded-lg bg-gradient-to-r from-primary to-blue-600 text-base font-bold">{saving ? "수정 중..." : "수정"}</Button></div>
+            {(editingPaper?.attachments?.length || 0) > 0 && (
+              <div className="space-y-2">
+                <Label className="font-bold">등록된 첨부파일</Label>
+                <ul className="space-y-2">
+                  {(editingPaper?.attachments || []).map((attachment) => {
+                    const isMarkedForDelete = attachmentIdsToDelete.includes(attachment.id);
+                    return (
+                      <li key={attachment.id} className={`flex min-w-0 items-center gap-3 rounded-lg border px-3 py-2.5 ${isMarkedForDelete ? "border-rose-200 bg-rose-50 opacity-70" : "border-slate-200 bg-white"}`}>
+                        <FileText className={`h-5 w-5 shrink-0 ${isMarkedForDelete ? "text-rose-500" : "text-primary"}`} aria-hidden="true" />
+                        <div className="min-w-0 flex-1">
+                          <p className={`truncate text-sm font-semibold ${isMarkedForDelete ? "text-rose-700 line-through" : "text-slate-800"}`}>{attachment.fileName}</p>
+                          <p className="text-xs text-slate-500">{formatFileSize(attachment.byteSize)}{isMarkedForDelete ? " · 저장하면 삭제됩니다" : ""}</p>
+                        </div>
+                        {isMarkedForDelete ? (
+                          <Button type="button" variant="ghost" size="sm" disabled={saving} className="h-10 shrink-0 rounded-md text-slate-600" onClick={() => setAttachmentIdsToDelete((current) => current.filter((id) => id !== attachment.id))}>
+                            <RotateCcw className="mr-1.5 h-4 w-4" aria-hidden="true" />되돌리기
+                          </Button>
+                        ) : (
+                          <Button type="button" variant="ghost" size="icon" disabled={saving} className="h-10 w-10 shrink-0 rounded-md text-slate-500 hover:text-destructive" onClick={() => setAttachmentDeleteCandidate(attachment)} aria-label={`${attachment.fileName} 삭제`}>
+                            <Trash2 className="h-4 w-4" />
+                          </Button>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              </div>
+            )}
+            <div className="space-y-2">
+              <Label htmlFor="edit-paper-attachments" className="font-bold">새 첨부파일 (선택)</Label>
+              <AttachmentDropzone
+                id="edit-paper-attachments"
+                files={newAttachments}
+                onChange={setNewAttachments}
+                existingCount={activeEditingAttachments.length}
+                existingBytes={activeEditingAttachmentBytes}
+                disabled={saving}
+              />
+            </div>
+            <div className="sticky bottom-0 z-20 -mx-6 -mb-6 flex gap-3 border-t border-slate-200 bg-white px-6 pb-6 pt-4 shadow-[0_-8px_20px_rgba(15,23,42,0.06)]"><Button type="button" variant="outline" onClick={() => setIsEditOpen(false)} disabled={saving} className="h-12 flex-1 rounded-lg text-base">취소</Button><Button type="submit" disabled={saving} className="h-12 flex-1 rounded-lg bg-gradient-to-r from-primary to-blue-600 text-base font-bold">{saving ? "수정 중..." : "수정"}</Button></div>
           </form>
         </DialogContent>
       </Dialog>
 
       <AlertDialog open={isAdmin && deleteId !== null} onOpenChange={(open) => { if (!open && !deleting) setDeleteId(null); }}>
         <AlertDialogContent className="rounded-xl"><AlertDialogHeader><AlertDialogTitle>논문을 삭제하시겠습니까?</AlertDialogTitle><AlertDialogDescription>이 작업은 되돌릴 수 없습니다.</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel disabled={deleting} className="h-11 rounded-lg">취소</AlertDialogCancel><AlertDialogAction disabled={deleting} onClick={(event) => { event.preventDefault(); void handleDelete(); }} className="h-11 rounded-lg bg-destructive text-destructive-foreground">{deleting ? "삭제 중..." : "삭제"}</AlertDialogAction></AlertDialogFooter></AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={isAdmin && attachmentDeleteCandidate !== null} onOpenChange={(open) => { if (!open) setAttachmentDeleteCandidate(null); }}>
+        <AlertDialogContent className="rounded-xl">
+          <AlertDialogHeader>
+            <AlertDialogTitle>첨부파일을 삭제하시겠습니까?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {attachmentDeleteCandidate?.fileName} 파일은 논문 수정을 저장할 때 삭제됩니다.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel className="h-11 rounded-lg">취소</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(event) => {
+                event.preventDefault();
+                if (attachmentDeleteCandidate) {
+                  setAttachmentIdsToDelete((current) => [...current, attachmentDeleteCandidate.id]);
+                }
+                setAttachmentDeleteCandidate(null);
+              }}
+              className="h-11 rounded-lg bg-destructive text-destructive-foreground"
+            >
+              삭제
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
       </AlertDialog>
 
       <Footer />

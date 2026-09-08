@@ -111,6 +111,28 @@ export async function ensureTablesExist() {
         content TEXT NOT NULL,
         date TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS paper_attachments (
+        id SERIAL PRIMARY KEY,
+        paper_id INTEGER NOT NULL REFERENCES papers(id) ON DELETE CASCADE,
+        file_name TEXT NOT NULL CHECK (char_length(file_name) BETWEEN 1 AND 255),
+        mime_type TEXT NOT NULL CHECK (mime_type IN (
+          'application/pdf',
+          'application/msword',
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+          'application/x-hwp',
+          'application/vnd.hancom.hwpx',
+          'application/vnd.ms-powerpoint',
+          'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+          'image/jpeg',
+          'image/png',
+          'image/webp'
+        )),
+        byte_size INTEGER NOT NULL CHECK (byte_size > 0 AND byte_size <= 10485760),
+        sort_order INTEGER NOT NULL CHECK (sort_order >= 0 AND sort_order < 5),
+        file_data BYTEA NOT NULL CHECK (octet_length(file_data) = byte_size),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
       
       CREATE TABLE IF NOT EXISTS talents (
         id SERIAL PRIMARY KEY,
@@ -181,6 +203,7 @@ export async function ensureTablesExist() {
       CREATE INDEX IF NOT EXISTS idx_talents_retention_until ON talents(retention_until);
       CREATE INDEX IF NOT EXISTS idx_notice_comments_user_id ON notice_comments(user_id);
       CREATE INDEX IF NOT EXISTS idx_paper_comments_user_id ON paper_comments(user_id);
+      CREATE INDEX IF NOT EXISTS idx_paper_attachments_paper_order ON paper_attachments(paper_id, sort_order, id);
       CREATE INDEX IF NOT EXISTS idx_admission_guidelines_date ON admission_guidelines(date DESC);
       CREATE INDEX IF NOT EXISTS idx_photo_albums_date ON photo_albums(date DESC, id DESC);
       CREATE INDEX IF NOT EXISTS idx_photo_images_album_order ON photo_images(album_id, sort_order, id);

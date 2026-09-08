@@ -105,12 +105,13 @@ const previewNotices: Notice[] = [
 ];
 
 export default function Home() {
-  const [notices, setNotices] = useState<Notice[]>(previewNotices);
+  const isLocalPreview = import.meta.env.DEV && window.location.port === "4173";
+  const [notices, setNotices] = useState<Notice[]>(() => isLocalPreview ? previewNotices : []);
 
   useEffect(() => {
-    if (import.meta.env.DEV && window.location.port === "4173") return;
-    api.notices.list().then((data) => setNotices(data.slice(0, 4))).catch(() => {});
-  }, []);
+    if (isLocalPreview) return;
+    api.notices.list().then((data) => setNotices(data.slice(0, 4))).catch(() => setNotices([]));
+  }, [isLocalPreview]);
 
   return (
     <div className="min-h-screen bg-white text-slate-900">

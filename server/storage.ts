@@ -1,10 +1,10 @@
 import {
-  users, notices, papers, talents, noticeComments, paperComments, admissionGuidelines, photoAlbums, photoImages,
+  users, notices, papers, paperAttachments, talents, noticeComments, paperComments, admissionGuidelines, photoAlbums, photoImages,
   type User, type InsertUser,
   type AdmissionGuideline, type InsertAdmissionGuideline,
   type PhotoAlbum, type InsertPhotoAlbum, type PhotoImage,
   type Notice, type InsertNotice,
-  type Paper, type InsertPaper,
+  type Paper, type InsertPaper, type PaperAttachment,
   type Talent, type InsertTalent,
   type NoticeComment, type InsertNoticeComment,
   type PaperComment, type InsertPaperComment
@@ -47,8 +47,36 @@ export type ReorderPhotoImagesResult =
   | { status: "invalid_order" };
 export type DeletePhotoImageResult = "deleted" | "not_found" | "last_image";
 
+export type StoredPaperAttachmentInput = Pick<PaperAttachment,
+  "fileName" | "mimeType" | "byteSize" | "data"
+>;
+export type PaperAttachmentMetadata = Omit<PaperAttachment, "data">;
+export type PaperWithAttachments = Paper & {
+  attachments: PaperAttachmentMetadata[];
+};
+export type AddPaperAttachmentsResult =
+  | { status: "created"; paper: PaperWithAttachments }
+  | { status: "not_found" }
+  | { status: "paper_full" }
+  | { status: "paper_too_large" };
+export type ReplacePaperAttachmentResult =
+  | { status: "updated"; attachment: PaperAttachmentMetadata }
+  | { status: "not_found" }
+  | { status: "paper_too_large" };
+export type UpdatePaperWithAttachmentsResult =
+  | { status: "updated"; paper: PaperWithAttachments }
+  | { status: "not_found" }
+  | { status: "attachment_not_found" }
+  | { status: "paper_full" }
+  | { status: "paper_too_large" };
+
 function photoImageMetadata(image: PhotoImage): PhotoImageMetadata {
   const { data: _data, ...metadata } = image;
+  return metadata;
+}
+
+function paperAttachmentMetadata(attachment: PaperAttachment): PaperAttachmentMetadata {
+  const { data: _data, ...metadata } = attachment;
   return metadata;
 }
 
@@ -108,10 +136,31 @@ export interface IStorage {
   updateNoticeComment(id: number, content: string): Promise<NoticeComment | undefined>;
   deleteNoticeComment(id: number): Promise<void>;
 
-  getPapers(): Promise<Paper[]>;
-  getPaper(id: number): Promise<Paper | undefined>;
-  createPaper(paper: InsertPaper): Promise<Paper>;
-  updatePaper(id: number, paper: Partial<InsertPaper>): Promise<Paper | undefined>;
+  getPapers(): Promise<PaperWithAttachments[]>;
+  getPaper(id: number): Promise<PaperWithAttachments | undefined>;
+  getPaperAttachment(id: number): Promise<PaperAttachment | undefined>;
+  createPaper(paper: InsertPaper, attachments?: StoredPaperAttachmentInput[]): Promise<PaperWithAttachments>;
+  updatePaper(id: number, paper: Partial<InsertPaper>): Promise<PaperWithAttachments | undefined>;
+  updatePaperWithAttachments(
+    id: number,
+    paper: Partial<InsertPaper>,
+    additions: StoredPaperAttachmentInput[],
+    deleteAttachmentIds: number[],
+    maxPaperBytes: number,
+    maxPaperAttachments: number,
+  ): Promise<UpdatePaperWithAttachmentsResult>;
+  addPaperAttachments(
+    id: number,
+    attachments: StoredPaperAttachmentInput[],
+    maxPaperBytes: number,
+    maxPaperAttachments: number,
+  ): Promise<AddPaperAttachmentsResult>;
+  replacePaperAttachment(
+    id: number,
+    attachment: StoredPaperAttachmentInput,
+    maxPaperBytes: number,
+  ): Promise<ReplacePaperAttachmentResult>;
+  deletePaperAttachment(id: number): Promise<boolean>;
   deletePaper(id: number): Promise<void>;
   incrementPaperViews(id: number): Promise<void>;
 
@@ -281,6 +330,7 @@ export class MemoryStorage implements IStorage {
   private talents: Talent[] = [];
   private noticeComments: NoticeComment[] = [];
   private paperComments: PaperComment[] = [];
+  private paperAttachments: PaperAttachment[] = [];
   private admissionGuidelines: AdmissionGuideline[] = [];
   private photoAlbums: PhotoAlbum[] = [];
   private photoImages: PhotoImage[] = [];
@@ -291,6 +341,7 @@ export class MemoryStorage implements IStorage {
     talents: 1,
     noticeComments: 1,
     paperComments: 1,
+    paperAttachments: 1,
     admissionGuidelines: 1,
     photoAlbums: 1,
     photoImages: 1,
@@ -621,13 +672,30 @@ export class MemoryStorage implements IStorage {
     this.noticeComments = this.noticeComments.filter(c => c.id !== id);
   }
 
-  async getPapers(): Promise<Paper[]> {
-    return [...this.papers].reverse();
+  private paperWithAttachments(paper: Paper): PaperWithAttachments {
+    return {
+      ...paper,
+      attachments: this.paperAttachments
+        .filter(attachment => attachment.paperId === paper.id)
+        .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id)
+        .map(paperAttachmentMetadata),
+    };
   }
-  async getPaper(id: number): Promise<Paper | undefined> {
-    return this.papers.find(p => p.id === id);
+
+  async getPapers(): Promise<PaperWithAttachments[]> {
+    return [...this.papers].reverse().map(paper => this.paperWithAttachments(paper));
   }
-  async createPaper(paper: InsertPaper): Promise<Paper> {
+  async getPaper(id: number): Promise<PaperWithAttachments | undefined> {
+    const paper = this.papers.find(candidate => candidate.id === id);
+    return paper ? this.paperWithAttachments(paper) : undefined;
+  }
+  async getPaperAttachment(id: number): Promise<PaperAttachment | undefined> {
+    return this.paperAttachments.find(attachment => attachment.id === id);
+  }
+  async createPaper(
+    paper: InsertPaper,
+    attachments: StoredPaperAttachmentInput[] = [],
+  ): Promise<PaperWithAttachments> {
     const newPaper: Paper = { 
       id: this.nextId.papers++,
       category: paper.category ?? 'conference',
@@ -647,16 +715,112 @@ export class MemoryStorage implements IStorage {
       views: paper.views ?? 0
     };
     this.papers.push(newPaper);
-    return newPaper;
+    attachments.forEach((attachment, index) => {
+      this.paperAttachments.push({
+        ...attachment,
+        id: this.nextId.paperAttachments++,
+        paperId: newPaper.id,
+        sortOrder: index,
+        createdAt: new Date(),
+      });
+    });
+    return this.paperWithAttachments(newPaper);
   }
-  async updatePaper(id: number, paper: Partial<InsertPaper>): Promise<Paper | undefined> {
+  async updatePaper(id: number, paper: Partial<InsertPaper>): Promise<PaperWithAttachments | undefined> {
     const existing = this.papers.find(p => p.id === id);
     if (existing) Object.assign(existing, paper);
-    return existing;
+    return existing ? this.paperWithAttachments(existing) : undefined;
+  }
+  async updatePaperWithAttachments(
+    id: number,
+    paper: Partial<InsertPaper>,
+    additions: StoredPaperAttachmentInput[],
+    deleteAttachmentIds: number[],
+    maxPaperBytes: number,
+    maxPaperAttachments: number,
+  ): Promise<UpdatePaperWithAttachmentsResult> {
+    const existingPaper = this.papers.find(candidate => candidate.id === id);
+    if (!existingPaper) return { status: "not_found" };
+    const current = this.paperAttachments.filter(attachment => attachment.paperId === id);
+    const requestedIds = new Set(deleteAttachmentIds);
+    if (requestedIds.size !== deleteAttachmentIds.length
+      || deleteAttachmentIds.some(attachmentId => !current.some(item => item.id === attachmentId))) {
+      return { status: "attachment_not_found" };
+    }
+    const remaining = current.filter(attachment => !requestedIds.has(attachment.id));
+    if (remaining.length + additions.length > maxPaperAttachments) return { status: "paper_full" };
+    const totalBytes = remaining.reduce((sum, attachment) => sum + attachment.byteSize, 0)
+      + additions.reduce((sum, attachment) => sum + attachment.byteSize, 0);
+    if (totalBytes > maxPaperBytes) return { status: "paper_too_large" };
+
+    Object.assign(existingPaper, paper);
+    this.paperAttachments = this.paperAttachments.filter(attachment => !requestedIds.has(attachment.id));
+    remaining
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id)
+      .forEach((attachment, index) => { attachment.sortOrder = index; });
+    additions.forEach((attachment, index) => {
+      this.paperAttachments.push({
+        ...attachment,
+        id: this.nextId.paperAttachments++,
+        paperId: id,
+        sortOrder: remaining.length + index,
+        createdAt: new Date(),
+      });
+    });
+    return { status: "updated", paper: this.paperWithAttachments(existingPaper) };
+  }
+  async addPaperAttachments(
+    id: number,
+    attachments: StoredPaperAttachmentInput[],
+    maxPaperBytes: number,
+    maxPaperAttachments: number,
+  ): Promise<AddPaperAttachmentsResult> {
+    const paper = this.papers.find(candidate => candidate.id === id);
+    if (!paper) return { status: "not_found" };
+    const existing = this.paperAttachments.filter(attachment => attachment.paperId === id);
+    if (existing.length + attachments.length > maxPaperAttachments) return { status: "paper_full" };
+    const totalBytes = existing.reduce((sum, attachment) => sum + attachment.byteSize, 0)
+      + attachments.reduce((sum, attachment) => sum + attachment.byteSize, 0);
+    if (totalBytes > maxPaperBytes) return { status: "paper_too_large" };
+    attachments.forEach((attachment, index) => {
+      this.paperAttachments.push({
+        ...attachment,
+        id: this.nextId.paperAttachments++,
+        paperId: id,
+        sortOrder: existing.length + index,
+        createdAt: new Date(),
+      });
+    });
+    return { status: "created", paper: this.paperWithAttachments(paper) };
+  }
+  async replacePaperAttachment(
+    id: number,
+    attachment: StoredPaperAttachmentInput,
+    maxPaperBytes: number,
+  ): Promise<ReplacePaperAttachmentResult> {
+    const existing = this.paperAttachments.find(candidate => candidate.id === id);
+    if (!existing) return { status: "not_found" };
+    const totalBytes = this.paperAttachments
+      .filter(candidate => candidate.paperId === existing.paperId && candidate.id !== id)
+      .reduce((sum, candidate) => sum + candidate.byteSize, 0) + attachment.byteSize;
+    if (totalBytes > maxPaperBytes) return { status: "paper_too_large" };
+    Object.assign(existing, attachment, { createdAt: new Date() });
+    return { status: "updated", attachment: paperAttachmentMetadata(existing) };
+  }
+  async deletePaperAttachment(id: number): Promise<boolean> {
+    const candidate = this.paperAttachments.find(attachment => attachment.id === id);
+    if (!candidate) return false;
+    this.paperAttachments = this.paperAttachments.filter(attachment => attachment.id !== id);
+    const remaining = this.paperAttachments
+      .filter(attachment => attachment.paperId === candidate.paperId)
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+    remaining.forEach((attachment, index) => { attachment.sortOrder = index; });
+    return true;
   }
   async deletePaper(id: number): Promise<void> {
     this.papers = this.papers.filter(p => p.id !== id);
     this.paperComments = this.paperComments.filter(c => c.paperId !== id);
+    this.paperAttachments = this.paperAttachments.filter(attachment => attachment.paperId !== id);
   }
   async incrementPaperViews(id: number): Promise<void> {
     const paper = this.papers.find(p => p.id === id);
@@ -1198,28 +1362,238 @@ export class DatabaseStorage implements IStorage {
     await this.db.delete(noticeComments).where(eq(noticeComments.id, id));
   }
 
-  async getPapers(): Promise<Paper[]> {
-    return await this.db.select().from(papers).orderBy(desc(papers.id));
+  private async getPaperAttachmentMetadata(
+    executor: any,
+    paperId?: number,
+  ): Promise<PaperAttachmentMetadata[]> {
+    const query = executor
+      .select({
+        id: paperAttachments.id,
+        paperId: paperAttachments.paperId,
+        fileName: paperAttachments.fileName,
+        mimeType: paperAttachments.mimeType,
+        byteSize: paperAttachments.byteSize,
+        sortOrder: paperAttachments.sortOrder,
+        createdAt: paperAttachments.createdAt,
+      })
+      .from(paperAttachments);
+    const rows = paperId === undefined
+      ? await query.orderBy(asc(paperAttachments.paperId), asc(paperAttachments.sortOrder), asc(paperAttachments.id))
+      : await query
+        .where(eq(paperAttachments.paperId, paperId))
+        .orderBy(asc(paperAttachments.sortOrder), asc(paperAttachments.id));
+    return rows;
   }
 
-  async getPaper(id: number): Promise<Paper | undefined> {
-    const [paper] = await this.db.select().from(papers).where(eq(papers.id, id));
-    return paper || undefined;
+  private async getPaperWithAttachments(
+    executor: any,
+    id: number,
+  ): Promise<PaperWithAttachments | undefined> {
+    const [paper] = await executor.select().from(papers).where(eq(papers.id, id));
+    if (!paper) return undefined;
+    return {
+      ...paper,
+      attachments: await this.getPaperAttachmentMetadata(executor, id),
+    };
   }
 
-  async createPaper(paper: InsertPaper): Promise<Paper> {
-    const [created] = await this.db.insert(papers).values(paper).returning();
-    return created;
+  async getPapers(): Promise<PaperWithAttachments[]> {
+    const records = await this.db.select().from(papers).orderBy(desc(papers.id));
+    if (!records.length) return [];
+    const attachments = await this.getPaperAttachmentMetadata(this.db);
+    const attachmentsByPaper = new Map<number, PaperAttachmentMetadata[]>();
+    attachments.forEach(attachment => {
+      const group = attachmentsByPaper.get(attachment.paperId) ?? [];
+      group.push(attachment);
+      attachmentsByPaper.set(attachment.paperId, group);
+    });
+    return records.map((paper: Paper) => ({
+      ...paper,
+      attachments: attachmentsByPaper.get(paper.id) ?? [],
+    }));
   }
 
-  async updatePaper(id: number, paper: Partial<InsertPaper>): Promise<Paper | undefined> {
+  async getPaper(id: number): Promise<PaperWithAttachments | undefined> {
+    return await this.getPaperWithAttachments(this.db, id);
+  }
+
+  async getPaperAttachment(id: number): Promise<PaperAttachment | undefined> {
+    const [attachment] = await this.db
+      .select()
+      .from(paperAttachments)
+      .where(eq(paperAttachments.id, id));
+    return attachment || undefined;
+  }
+
+  async createPaper(
+    paper: InsertPaper,
+    attachments: StoredPaperAttachmentInput[] = [],
+  ): Promise<PaperWithAttachments> {
+    return await this.db.transaction(async (transaction: any) => {
+      const [created] = await transaction.insert(papers).values(paper).returning();
+      if (attachments.length) {
+        await transaction.insert(paperAttachments).values(attachments.map((attachment, index) => ({
+          ...attachment,
+          paperId: created.id,
+          sortOrder: index,
+        })));
+      }
+      return (await this.getPaperWithAttachments(transaction, created.id))!;
+    });
+  }
+
+  async updatePaper(id: number, paper: Partial<InsertPaper>): Promise<PaperWithAttachments | undefined> {
     const [updated] = await this.db.update(papers).set(paper).where(eq(papers.id, id)).returning();
-    return updated || undefined;
+    return updated ? await this.getPaperWithAttachments(this.db, id) : undefined;
+  }
+
+  async updatePaperWithAttachments(
+    id: number,
+    paper: Partial<InsertPaper>,
+    additions: StoredPaperAttachmentInput[],
+    deleteAttachmentIds: number[],
+    maxPaperBytes: number,
+    maxPaperAttachments: number,
+  ): Promise<UpdatePaperWithAttachmentsResult> {
+    return await this.db.transaction(async (transaction: any) => {
+      await transaction.execute(sql`SELECT id FROM papers WHERE id = ${id} FOR UPDATE`);
+      const [existingPaper] = await transaction.select().from(papers).where(eq(papers.id, id));
+      if (!existingPaper) return { status: "not_found" } as const;
+
+      const current = await this.getPaperAttachmentMetadata(transaction, id);
+      const requestedIds = new Set(deleteAttachmentIds);
+      if (requestedIds.size !== deleteAttachmentIds.length
+        || deleteAttachmentIds.some(attachmentId => !current.some(item => item.id === attachmentId))) {
+        return { status: "attachment_not_found" } as const;
+      }
+      const remaining = current.filter(attachment => !requestedIds.has(attachment.id));
+      if (remaining.length + additions.length > maxPaperAttachments) {
+        return { status: "paper_full" } as const;
+      }
+      const totalBytes = remaining.reduce((sum, attachment) => sum + attachment.byteSize, 0)
+        + additions.reduce((sum, attachment) => sum + attachment.byteSize, 0);
+      if (totalBytes > maxPaperBytes) return { status: "paper_too_large" } as const;
+
+      if (Object.keys(paper).length) {
+        await transaction.update(papers).set(paper).where(eq(papers.id, id));
+      }
+      if (deleteAttachmentIds.length) {
+        await transaction.execute(sql`
+          DELETE FROM paper_attachments
+          WHERE paper_id = ${id}
+            AND id = ANY(${deleteAttachmentIds}::int[])
+        `);
+      }
+      for (let index = 0; index < remaining.length; index += 1) {
+        await transaction
+          .update(paperAttachments)
+          .set({ sortOrder: index })
+          .where(eq(paperAttachments.id, remaining[index].id));
+      }
+      if (additions.length) {
+        await transaction.insert(paperAttachments).values(additions.map((attachment, index) => ({
+          ...attachment,
+          paperId: id,
+          sortOrder: remaining.length + index,
+        })));
+      }
+      return {
+        status: "updated",
+        paper: (await this.getPaperWithAttachments(transaction, id))!,
+      } as const;
+    });
+  }
+
+  async addPaperAttachments(
+    id: number,
+    attachments: StoredPaperAttachmentInput[],
+    maxPaperBytes: number,
+    maxPaperAttachments: number,
+  ): Promise<AddPaperAttachmentsResult> {
+    return await this.db.transaction(async (transaction: any) => {
+      await transaction.execute(sql`SELECT id FROM papers WHERE id = ${id} FOR UPDATE`);
+      const [paper] = await transaction.select().from(papers).where(eq(papers.id, id));
+      if (!paper) return { status: "not_found" } as const;
+      const existing = await this.getPaperAttachmentMetadata(transaction, id);
+      if (existing.length + attachments.length > maxPaperAttachments) {
+        return { status: "paper_full" } as const;
+      }
+      const totalBytes = existing.reduce((sum, attachment) => sum + attachment.byteSize, 0)
+        + attachments.reduce((sum, attachment) => sum + attachment.byteSize, 0);
+      if (totalBytes > maxPaperBytes) return { status: "paper_too_large" } as const;
+      if (attachments.length) {
+        await transaction.insert(paperAttachments).values(attachments.map((attachment, index) => ({
+          ...attachment,
+          paperId: id,
+          sortOrder: existing.length + index,
+        })));
+      }
+      return {
+        status: "created",
+        paper: (await this.getPaperWithAttachments(transaction, id))!,
+      } as const;
+    });
+  }
+
+  async replacePaperAttachment(
+    id: number,
+    attachment: StoredPaperAttachmentInput,
+    maxPaperBytes: number,
+  ): Promise<ReplacePaperAttachmentResult> {
+    return await this.db.transaction(async (transaction: any) => {
+      const [candidate] = await transaction
+        .select()
+        .from(paperAttachments)
+        .where(eq(paperAttachments.id, id));
+      if (!candidate) return { status: "not_found" } as const;
+      await transaction.execute(sql`SELECT id FROM papers WHERE id = ${candidate.paperId} FOR UPDATE`);
+      const existing = await this.getPaperAttachmentMetadata(transaction, candidate.paperId);
+      const totalBytes = existing
+        .filter(item => item.id !== id)
+        .reduce((sum, item) => sum + item.byteSize, 0) + attachment.byteSize;
+      if (totalBytes > maxPaperBytes) return { status: "paper_too_large" } as const;
+      const [updated] = await transaction
+        .update(paperAttachments)
+        .set({ ...attachment, createdAt: new Date() })
+        .where(eq(paperAttachments.id, id))
+        .returning();
+      if (!updated) return { status: "not_found" } as const;
+      return {
+        status: "updated",
+        attachment: paperAttachmentMetadata(updated),
+      } as const;
+    });
+  }
+
+  async deletePaperAttachment(id: number): Promise<boolean> {
+    return await this.db.transaction(async (transaction: any) => {
+      const [candidate] = await transaction
+        .select()
+        .from(paperAttachments)
+        .where(eq(paperAttachments.id, id));
+      if (!candidate) return false;
+      await transaction.execute(sql`SELECT id FROM papers WHERE id = ${candidate.paperId} FOR UPDATE`);
+      const [deleted] = await transaction
+        .delete(paperAttachments)
+        .where(eq(paperAttachments.id, id))
+        .returning({ id: paperAttachments.id });
+      if (!deleted) return false;
+      const remaining = await this.getPaperAttachmentMetadata(transaction, candidate.paperId);
+      for (let index = 0; index < remaining.length; index += 1) {
+        await transaction
+          .update(paperAttachments)
+          .set({ sortOrder: index })
+          .where(eq(paperAttachments.id, remaining[index].id));
+      }
+      return true;
+    });
   }
 
   async deletePaper(id: number): Promise<void> {
-    await this.db.delete(paperComments).where(eq(paperComments.paperId, id));
-    await this.db.delete(papers).where(eq(papers.id, id));
+    await this.db.transaction(async (transaction: any) => {
+      await transaction.delete(paperComments).where(eq(paperComments.paperId, id));
+      await transaction.delete(papers).where(eq(papers.id, id));
+    });
   }
 
   async incrementPaperViews(id: number): Promise<void> {

@@ -91,6 +91,19 @@ let uploadAfterErrorStarted = false;
 uploadConcurrencyGuard(mockRequest(), uploadAfterErrorResponse, () => { uploadAfterErrorStarted = true; });
 assert.equal(uploadAfterErrorStarted, true);
 uploadAfterErrorResponse.emit("error", new Error("simulated response error"));
+const alreadyAbortedUploadResponse = mockEventResponse();
+let alreadyAbortedUploadStarted = false;
+uploadConcurrencyGuard(
+  mockRequest({ aborted: true }),
+  alreadyAbortedUploadResponse,
+  () => { alreadyAbortedUploadStarted = true; },
+);
+assert.equal(alreadyAbortedUploadStarted, false);
+const uploadAfterPriorAbortResponse = mockEventResponse();
+let uploadAfterPriorAbortStarted = false;
+uploadConcurrencyGuard(mockRequest(), uploadAfterPriorAbortResponse, () => { uploadAfterPriorAbortStarted = true; });
+assert.equal(uploadAfterPriorAbortStarted, true);
+uploadAfterPriorAbortResponse.emit("close");
 
 const routesSource = await readFile(new URL("../server/routes.ts", import.meta.url), "utf8");
 const storageSource = await readFile(new URL("../server/storage.ts", import.meta.url), "utf8");
@@ -167,6 +180,18 @@ for (const route of ['app.post("/api/photos"', 'app.post("/api/photos/:id/images
   assert.ok(
     (declaration?.indexOf("photoUploadConcurrency") ?? -1) < (declaration?.indexOf("photoUploadMiddleware") ?? -1),
     `${route} must acquire an upload slot before buffering multipart files`,
+  );
+}
+for (const [label, pattern] of [
+  ["paper create", /app\.post\("\/api\/papers",\s*adminOnly,\s*paperAttachmentUploadConcurrency,\s*paperAttachmentUploadLimiter,\s*publicContentMutationLimiter,\s*paperAttachmentArrayUpload,/s],
+  ["paper atomic update", /app\.patch\("\/api\/papers\/:id",\s*adminOnly,\s*paperAttachmentUploadConcurrency,\s*paperAttachmentUploadLimiter,\s*publicContentMutationLimiter,\s*paperAttachmentArrayUpload,/s],
+  ["paper attachment add", /app\.post\(\s*"\/api\/papers\/:id\/attachments",\s*adminOnly,\s*paperAttachmentUploadConcurrency,\s*paperAttachmentUploadLimiter,\s*paperAttachmentArrayUpload,/s],
+  ["paper attachment replace", /app\.put\(\s*"\/api\/paper-attachments\/:id",\s*adminOnly,\s*paperAttachmentUploadConcurrency,\s*paperAttachmentUploadLimiter,\s*paperAttachmentSingleUpload,/s],
+] as const) {
+  assert.match(
+    routesSource,
+    pattern,
+    `${label} must authenticate, acquire concurrency, rate-limit, then parse multipart in that order`,
   );
 }
 assert.ok(routesSource.includes("limitInputPixels: 40_000_000"), "Photo decoding must limit input pixels");
@@ -373,6 +398,12 @@ assert.equal((await storage.updateNotice(notice.id, { title: "Updated operations
 await storage.deleteNotice(notice.id);
 assert.equal(await storage.getNotice(notice.id), undefined);
 
+const memoryPaperAttachment = (name: string, size = 8) => ({
+  fileName: name,
+  mimeType: "application/pdf",
+  byteSize: size,
+  data: Buffer.alloc(size, 7),
+});
 const paper = await storage.createPaper({
   category: "journal",
   title: "Operations paper",
@@ -389,10 +420,42 @@ const paper = await storage.createPaper({
   websiteUrl: "https://example.edu/paper",
   date: "2026.08.24",
   views: 0,
-});
+}, [memoryPaperAttachment("논문.pdf")]);
+assert.equal(paper.attachments.length, 1);
+assert.equal("data" in paper.attachments[0], false);
+assert.deepEqual(
+  (await storage.getPaperAttachment(paper.attachments[0].id))?.data,
+  Buffer.alloc(8, 7),
+);
 assert.equal((await storage.updatePaper(paper.id, { title: "Updated operations paper" }))?.title, "Updated operations paper");
+const addedPaperAttachment = await storage.addPaperAttachments(
+  paper.id,
+  [memoryPaperAttachment("발표자료.pdf")],
+  30,
+  5,
+);
+assert.equal(addedPaperAttachment.status, "created");
+const atomicPaperUpdate = await storage.updatePaperWithAttachments(
+  paper.id,
+  { title: "Atomically updated operations paper" },
+  [memoryPaperAttachment("교체자료.pdf")],
+  [paper.attachments[0].id],
+  30,
+  5,
+);
+assert.equal(atomicPaperUpdate.status, "updated");
+if (atomicPaperUpdate.status === "updated") {
+  assert.equal(atomicPaperUpdate.paper.title, "Atomically updated operations paper");
+  assert.equal(atomicPaperUpdate.paper.attachments.length, 2);
+  assert.equal("data" in atomicPaperUpdate.paper.attachments[0], false);
+}
+assert.equal(
+  (await storage.addPaperAttachments(paper.id, [memoryPaperAttachment("too-large.pdf", 31)], 30, 5)).status,
+  "paper_too_large",
+);
 await storage.deletePaper(paper.id);
 assert.equal(await storage.getPaper(paper.id), undefined);
+assert.equal(await storage.getPaperAttachment(paper.attachments[0].id), undefined);
 
 const memoryPhotoImage = (name: string, size = 4) => ({
   fileName: name,
@@ -493,7 +556,12 @@ const protectedPaper = await integrationStorage.createPaper({
   websiteUrl: "https://example.edu/protected-conference",
   date: "2026.08.31",
   views: 0,
-});
+}, [{
+  fileName: "protected.pdf",
+  mimeType: "application/pdf",
+  byteSize: 8,
+  data: Buffer.alloc(8, 3),
+}]);
 const integrationApp = express();
 const integrationServer = createServer(integrationApp);
 const integrationNodeEnv = process.env.NODE_ENV;
@@ -540,9 +608,15 @@ try {
     });
   }
 
-  async function requestForm(route: string, formData: FormData, origin = baseUrl, cookie?: string) {
+  async function requestMultipart(
+    method: "POST" | "PATCH" | "PUT",
+    route: string,
+    formData: FormData,
+    origin = baseUrl,
+    cookie?: string,
+  ) {
     return await fetch(`${baseUrl}${route}`, {
-      method: "POST",
+      method,
       headers: {
         Origin: origin,
         "Sec-Fetch-Site": origin === baseUrl ? "same-origin" : "cross-site",
@@ -550,6 +624,9 @@ try {
       },
       body: formData,
     });
+  }
+  async function requestForm(route: string, formData: FormData, origin = baseUrl, cookie?: string) {
+    return await requestMultipart("POST", route, formData, origin, cookie);
   }
 
   const photoPng = await sharp({
@@ -560,6 +637,17 @@ try {
       background: { r: 15, g: 74, b: 130 },
     },
   }).png().toBuffer();
+  const paperJpeg = await sharp(photoPng).jpeg().toBuffer();
+  const paperWebp = await sharp(photoPng).webp().toBuffer();
+  const oleHeader = Buffer.from([0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]);
+  const oleDocument = (...streamNames: string[]) => Buffer.concat([
+    oleHeader,
+    ...streamNames.map(name => Buffer.from(name, "utf16le")),
+  ]);
+  const zipContainer = (...markers: string[]) => Buffer.concat([
+    Buffer.from([0x50, 0x4b, 0x03, 0x04]),
+    ...markers.map(marker => Buffer.from(marker, "utf8")),
+  ]);
   function photoForm(title = "Administrator photo integration test", imageCount = 1) {
     const form = new FormData();
     form.append("title", title);
@@ -567,7 +655,7 @@ try {
     form.append("organization", "Dankook Graduate School");
     form.append("date", "2026-09-08");
     for (let index = 0; index < imageCount; index += 1) {
-      form.append("images", new Blob([photoPng], { type: "image/png" }), `fixture-${index + 1}.png`);
+      form.append("images", new Blob([photoPng], { type: "image/png" }), `사진-자료실-${index + 1}.png`);
     }
     return form;
   }
@@ -576,6 +664,21 @@ try {
     for (let index = 0; index < count; index += 1) {
       form.append("images", new Blob([photoPng], { type: "image/png" }), `fixture-${index + 1}.png`);
     }
+    return form;
+  }
+
+  const paperPdf = Buffer.from("%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n");
+  function paperForm(
+    input: Record<string, unknown>,
+    files: Array<{ name: string; type: string; data: Buffer }> = [
+      { name: "학술대회-논문.pdf", type: "application/pdf", data: paperPdf },
+    ],
+  ) {
+    const form = new FormData();
+    form.append("paper", JSON.stringify(input));
+    files.forEach(file => {
+      form.append("attachments", new Blob([file.data], { type: file.type }), file.name);
+    });
     return form;
   }
 
@@ -645,6 +748,24 @@ try {
   const unauthorizedPaperDeleteResponse = await request("DELETE", `/api/papers/${protectedPaper.id}`);
   assert.equal(unauthorizedPaperDeleteResponse.status, 401);
   assert.ok(await integrationStorage.getPaper(protectedPaper.id));
+
+  const unauthorizedPaperMultipartCreateResponse = await requestForm("/api/papers", paperForm(paperInput));
+  assert.equal(unauthorizedPaperMultipartCreateResponse.status, 401);
+  const protectedAttachmentId = protectedPaper.attachments[0].id;
+  assert.equal(
+    (await requestForm(`/api/papers/${protectedPaper.id}/attachments`, paperForm(paperInput))).status,
+    401,
+  );
+  assert.equal(
+    (await requestMultipart(
+      "PUT",
+      `/api/paper-attachments/${protectedAttachmentId}`,
+      paperForm(paperInput),
+    )).status,
+    401,
+  );
+  assert.equal((await request("DELETE", `/api/paper-attachments/${protectedAttachmentId}`)).status, 401);
+  assert.ok(await integrationStorage.getPaperAttachment(protectedAttachmentId));
 
   const unauthorizedUploadResponse = await request("POST", "/api/upload");
   assert.equal(unauthorizedUploadResponse.status, 401);
@@ -783,6 +904,21 @@ try {
   assert.equal(rejectedPaperOriginDeleteResponse.status, 403);
   assert.ok(await integrationStorage.getPaper(protectedPaper.id));
 
+  const rejectedPaperMultipartOriginCreateResponse = await requestForm(
+    "/api/papers",
+    paperForm(paperInput),
+    "https://untrusted.example",
+    adminCookie,
+  );
+  assert.equal(rejectedPaperMultipartOriginCreateResponse.status, 403);
+  const rejectedPaperAttachmentOriginAddResponse = await requestForm(
+    `/api/papers/${protectedPaper.id}/attachments`,
+    paperForm(paperInput),
+    "https://untrusted.example",
+    adminCookie,
+  );
+  assert.equal(rejectedPaperAttachmentOriginAddResponse.status, 403);
+
   const rejectedUploadOriginResponse = await request(
     "POST",
     "/api/upload",
@@ -854,27 +990,235 @@ try {
   )).status, 200);
   assert.equal(await integrationStorage.getAdmissionGuideline(integrationAdmission.id), undefined);
 
-  const paperCreateResponse = await request(
-    "POST",
+  const invalidDocxResponse = await requestForm(
     "/api/papers",
-    paperInput,
+    paperForm(
+      { ...paperInput, title: "Renamed generic ZIP must be rejected" },
+      [{
+        name: "not-a-word-document.docx",
+        type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        data: Buffer.from([0x50, 0x4b, 0x03, 0x04, 0x00, 0x00]),
+      }],
+    ),
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(invalidDocxResponse.status, 400);
+  assert.equal((await invalidDocxResponse.json() as { code: string }).code, "PAPER_ATTACHMENT_CONTENT_INVALID");
+
+  const paperCountBeforeExcessFileRequest = (await integrationStorage.getPapers()).length;
+  const excessFileCountResponse = await requestForm(
+    "/api/papers",
+    paperForm(
+      { ...paperInput, title: "Six paper files must be rejected" },
+      Array.from({ length: 6 }, (_, index) => ({
+        name: `excess-${index + 1}.pdf`,
+        type: "application/pdf",
+        data: paperPdf,
+      })),
+    ),
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(excessFileCountResponse.status, 400);
+  assert.equal((await excessFileCountResponse.json() as { code: string }).code, "PAPER_ATTACHMENT_REJECTED");
+  assert.equal((await integrationStorage.getPapers()).length, paperCountBeforeExcessFileRequest);
+
+  const supportedPaperFiles = [
+    { name: "paper.pdf", type: "application/pdf", data: paperPdf, expectedMime: "application/pdf" },
+    { name: "paper.doc", type: "application/msword", data: oleDocument("WordDocument"), expectedMime: "application/msword" },
+    {
+      name: "paper.docx",
+      type: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      data: zipContainer("[Content_Types].xml", "word/document.xml"),
+      expectedMime: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    },
+    { name: "paper.hwp", type: "application/x-hwp", data: oleDocument("FileHeader", "BodyText"), expectedMime: "application/x-hwp" },
+    { name: "paper.hwpx", type: "application/vnd.hancom.hwpx", data: zipContainer("Contents/", "content.hpf"), expectedMime: "application/vnd.hancom.hwpx" },
+    { name: "slides.ppt", type: "application/vnd.ms-powerpoint", data: oleDocument("PowerPoint Document"), expectedMime: "application/vnd.ms-powerpoint" },
+    {
+      name: "slides.pptx",
+      type: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      data: zipContainer("[Content_Types].xml", "ppt/presentation.xml"),
+      expectedMime: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    },
+    { name: "figure.jpg", type: "image/jpeg", data: paperJpeg, expectedMime: "image/jpeg" },
+    { name: "figure.png", type: "image/png", data: photoPng, expectedMime: "image/png" },
+    { name: "figure.webp", type: "image/webp", data: paperWebp, expectedMime: "image/webp" },
+  ];
+  for (let groupIndex = 0; groupIndex < supportedPaperFiles.length; groupIndex += 5) {
+    const group = supportedPaperFiles.slice(groupIndex, groupIndex + 5);
+    const supportedFormatsResponse = await requestForm(
+      "/api/papers",
+      paperForm({
+        ...paperInput,
+        category: "conference",
+        title: `Supported conference attachment formats ${groupIndex / 5 + 1}`,
+        venue: "Security Integration Conference",
+        journal: null,
+      }, group),
+      baseUrl,
+      adminCookie,
+    );
+    assert.equal(supportedFormatsResponse.status, 201);
+    const supportedFormatsPaper = await supportedFormatsResponse.json() as {
+      id: number;
+      category: string;
+      attachments: Array<{ fileName: string; mimeType: string }>;
+    };
+    assert.equal(supportedFormatsPaper.category, "conference");
+    assert.deepEqual(supportedFormatsPaper.attachments.map(file => file.fileName), group.map(file => file.name));
+    assert.deepEqual(supportedFormatsPaper.attachments.map(file => file.mimeType), group.map(file => file.expectedMime));
+    assert.equal((await request(
+      "DELETE",
+      `/api/papers/${supportedFormatsPaper.id}`,
+      undefined,
+      baseUrl,
+      adminCookie,
+    )).status, 200);
+  }
+
+  const paperCreateResponse = await requestForm(
+    "/api/papers",
+    paperForm(paperInput),
     baseUrl,
     adminCookie,
   );
   assert.equal(paperCreateResponse.status, 201);
-  const integrationPaper = await paperCreateResponse.json() as { id: number };
+  const integrationPaper = await paperCreateResponse.json() as {
+    id: number;
+    attachments: Array<{
+      id: number;
+      fileName: string;
+      mimeType: string;
+      byteSize: number;
+      downloadUrl: string;
+    }>;
+  };
   integrationPaperId = integrationPaper.id;
+  assert.equal(integrationPaper.attachments.length, 1);
+  assert.equal("data" in integrationPaper.attachments[0], false);
+  const originalPaperAttachmentId = integrationPaper.attachments[0].id;
   const paperGetResponse = await fetch(`${baseUrl}/api/papers/${integrationPaper.id}`);
   assert.equal(paperGetResponse.status, 200);
-  assert.equal("comments" in await paperGetResponse.json() as Record<string, unknown>, false);
-  const paperPatchResponse = await request(
+  const paperDetail = await paperGetResponse.json() as Record<string, unknown> & {
+    attachments: Array<Record<string, unknown>>;
+  };
+  assert.equal("comments" in paperDetail, false);
+  assert.equal("data" in paperDetail.attachments[0], false);
+  const paperListResponse = await fetch(`${baseUrl}/api/papers`);
+  assert.equal(paperListResponse.status, 200);
+  assert.equal(JSON.stringify(await paperListResponse.json()).includes("file_data"), false);
+
+  const paperDownloadResponse = await fetch(
+    `${baseUrl}${integrationPaper.attachments[0].downloadUrl}`,
+  );
+  assert.equal(paperDownloadResponse.status, 200);
+  assert.match(paperDownloadResponse.headers.get("content-disposition") ?? "", /^attachment;/i);
+  assert.match(paperDownloadResponse.headers.get("content-disposition") ?? "", /filename\*=UTF-8''/i);
+  assert.match(paperDownloadResponse.headers.get("content-type") ?? "", /^application\/pdf/i);
+  assert.match(paperDownloadResponse.headers.get("cache-control") ?? "", /no-store/);
+  assert.equal(paperDownloadResponse.headers.get("x-content-type-options"), "nosniff");
+  assert.deepEqual(Buffer.from(await paperDownloadResponse.arrayBuffer()), paperPdf);
+
+  const originalGetPaperAttachment = integrationStorage.getPaperAttachment.bind(integrationStorage);
+  let concurrentPaperAttachmentReads = 0;
+  let releasePaperAttachmentReads!: () => void;
+  const paperAttachmentReadGate = new Promise<void>(resolve => { releasePaperAttachmentReads = resolve; });
+  integrationStorage.getPaperAttachment = async id => {
+    concurrentPaperAttachmentReads += 1;
+    await paperAttachmentReadGate;
+    return await originalGetPaperAttachment(id);
+  };
+  const paperAttachmentControllers = Array.from({ length: 4 }, () => new AbortController());
+  const concurrentPaperAttachmentDownloads = paperAttachmentControllers.map(controller => fetch(
+    `${baseUrl}${integrationPaper.attachments[0].downloadUrl}`,
+    { signal: controller.signal },
+  ).catch(error => error as Error));
+  try {
+    for (let attempt = 0; attempt < 100 && concurrentPaperAttachmentReads < 4; attempt += 1) {
+      await new Promise<void>(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(concurrentPaperAttachmentReads, 4);
+    paperAttachmentControllers.forEach(controller => controller.abort());
+    const rejectedConcurrentPaperDownload = await fetch(
+      `${baseUrl}${integrationPaper.attachments[0].downloadUrl}`,
+    );
+    assert.equal(rejectedConcurrentPaperDownload.status, 429);
+    assert.equal(
+      (await rejectedConcurrentPaperDownload.json() as { code: string }).code,
+      "PAPER_ATTACHMENT_DOWNLOAD_BUSY",
+    );
+  } finally {
+    releasePaperAttachmentReads();
+    await Promise.all(concurrentPaperAttachmentDownloads);
+    integrationStorage.getPaperAttachment = originalGetPaperAttachment;
+  }
+
+  const addAttachmentForm = new FormData();
+  addAttachmentForm.append(
+    "attachments",
+    new Blob([paperPdf], { type: "application/pdf" }),
+    "추가자료.pdf",
+  );
+  const paperAttachmentAddResponse = await requestMultipart(
+    "POST",
+    `/api/papers/${integrationPaper.id}/attachments`,
+    addAttachmentForm,
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(paperAttachmentAddResponse.status, 201);
+  const paperAfterAdd = await paperAttachmentAddResponse.json() as {
+    attachments: Array<{ id: number }>;
+  };
+  assert.equal(paperAfterAdd.attachments.length, 2);
+  const addedPaperAttachmentId = paperAfterAdd.attachments.find(
+    attachment => attachment.id !== originalPaperAttachmentId,
+  )!.id;
+
+  const replacementForm = new FormData();
+  replacementForm.append(
+    "attachment",
+    new Blob([paperPdf], { type: "application/pdf" }),
+    "수정된-추가자료.pdf",
+  );
+  const paperAttachmentReplaceResponse = await requestMultipart(
+    "PUT",
+    `/api/paper-attachments/${addedPaperAttachmentId}`,
+    replacementForm,
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(paperAttachmentReplaceResponse.status, 200);
+  assert.equal(
+    (await paperAttachmentReplaceResponse.json() as { fileName: string }).fileName,
+    "수정된-추가자료.pdf",
+  );
+
+  const paperPatchResponse = await requestMultipart(
     "PATCH",
     `/api/papers/${integrationPaper.id}`,
-    { title: "Updated administrator journal" },
+    paperForm({
+      title: "Updated administrator journal",
+      deleteAttachmentIds: [originalPaperAttachmentId, addedPaperAttachmentId],
+    }),
     baseUrl,
     adminCookie,
   );
   assert.equal(paperPatchResponse.status, 200);
+  const paperAfterAtomicPatch = await paperPatchResponse.json() as {
+    title: string;
+    attachments: Array<{ id: number }>;
+  };
+  assert.equal(paperAfterAtomicPatch.title, "Updated administrator journal");
+  assert.equal(paperAfterAtomicPatch.attachments.length, 1);
+  assert.notEqual(paperAfterAtomicPatch.attachments[0].id, originalPaperAttachmentId);
+  const finalPaperAttachmentId = paperAfterAtomicPatch.attachments[0].id;
+  assert.equal(
+    (await fetch(`${baseUrl}/api/paper-attachments/${originalPaperAttachmentId}/download`)).status,
+    404,
+  );
   assert.equal(
     (await integrationStorage.getPaper(integrationPaper.id))?.title,
     "Updated administrator journal",
@@ -892,6 +1236,7 @@ try {
     adminCookie,
   )).status, 200);
   assert.equal(await integrationStorage.getPaper(integrationPaper.id), undefined);
+  assert.equal(await integrationStorage.getPaperAttachment(finalPaperAttachmentId), undefined);
 
   const photoCreateResponse = await requestForm("/api/photos", photoForm(), baseUrl, adminCookie);
   assert.equal(photoCreateResponse.status, 201);
@@ -900,11 +1245,12 @@ try {
     title: string;
     imageCount: number;
     coverImage: { id: number; url: string; downloadUrl: string; mimeType: string; altText: string };
-    images: Array<{ id: number; url: string; downloadUrl: string; mimeType: string; altText: string }>;
+    images: Array<{ id: number; fileName: string; url: string; downloadUrl: string; mimeType: string; altText: string }>;
   };
   integrationPhotoAlbumId = integrationPhoto.id;
   assert.equal(integrationPhoto.imageCount, 1);
   assert.equal(integrationPhoto.images.length, 1);
+  assert.equal(integrationPhoto.images[0].fileName, "사진-자료실-1.webp");
   assert.equal(integrationPhoto.images[0].mimeType, "image/webp");
   assert.equal(integrationPhoto.images[0].altText, `${integrationPhoto.title} 사진 1`);
   assert.equal("data" in integrationPhoto.images[0], false);

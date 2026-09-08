@@ -157,11 +157,33 @@ export const papers = pgTable("papers", {
 
 export const papersRelations = relations(papers, ({ many }) => ({
   comments: many(paperComments),
+  attachments: many(paperAttachments),
 }));
 
 export const insertPaperSchema = createInsertSchema(papers).omit({ id: true });
 export type InsertPaper = z.infer<typeof insertPaperSchema>;
 export type Paper = typeof papers.$inferSelect;
+
+export const paperAttachments = pgTable("paper_attachments", {
+  id: serial("id").primaryKey(),
+  paperId: integer("paper_id")
+    .notNull()
+    .references(() => papers.id, { onDelete: "cascade" }),
+  fileName: text("file_name").notNull(),
+  mimeType: text("mime_type").notNull(),
+  byteSize: integer("byte_size").notNull(),
+  sortOrder: integer("sort_order").notNull(),
+  data: bytea("file_data").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("idx_paper_attachments_paper_order").on(table.paperId, table.sortOrder, table.id),
+]);
+
+export const paperAttachmentsRelations = relations(paperAttachments, ({ one }) => ({
+  paper: one(papers, { fields: [paperAttachments.paperId], references: [papers.id] }),
+}));
+
+export type PaperAttachment = typeof paperAttachments.$inferSelect;
 
 export const paperComments = pgTable("paper_comments", {
   id: serial("id").primaryKey(),
