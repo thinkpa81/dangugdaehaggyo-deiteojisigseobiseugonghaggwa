@@ -91,9 +91,21 @@ export interface Paper {
   websiteUrl: string | null;
   date: string;
   views: number;
+  attachments?: PaperAttachment[];
 }
 
-export type PaperCreateInput = Omit<Paper, "id" | "views">;
+export interface PaperAttachment {
+  id: number;
+  paperId: number;
+  fileName: string;
+  mimeType: string;
+  byteSize: number;
+  sortOrder: number;
+  createdAt: string;
+  downloadUrl?: string;
+}
+
+export type PaperCreateInput = Omit<Paper, "id" | "views" | "files" | "attachments">;
 export type PaperUpdateInput = Partial<Omit<PaperCreateInput, "date">>;
 
 export interface PhotoImage {
@@ -167,7 +179,7 @@ async function fetchApi<T>(url: string, options?: RequestInit): Promise<T> {
   return res.json();
 }
 
-async function fetchMultipart<T>(url: string, formData: FormData, method: "POST" | "PATCH" = "POST"): Promise<T> {
+async function fetchMultipart<T>(url: string, formData: FormData, method: "POST" | "PATCH" | "PUT" = "POST"): Promise<T> {
   const res = await fetch(`${API_BASE}${url}`, {
     method,
     body: formData,
@@ -197,6 +209,26 @@ function photoFormData(data: Partial<PhotoAlbumInput>, images: File[]) {
     if (value !== undefined) formData.append(key, value);
   });
   images.forEach((file) => formData.append("images", file));
+  return formData;
+}
+
+function paperFormData(data: PaperCreateInput, attachments: File[]) {
+  const formData = new FormData();
+  formData.append("paper", JSON.stringify(data));
+  attachments.forEach((file) => formData.append("attachments", file));
+  return formData;
+}
+
+function paperAttachmentsFormData(attachments: File[], fieldName = "attachments") {
+  const formData = new FormData();
+  attachments.forEach((file) => formData.append(fieldName, file));
+  return formData;
+}
+
+function paperUpdateFormData(data: PaperUpdateInput & { deleteAttachmentIds: number[] }, attachments: File[]) {
+  const formData = new FormData();
+  formData.append("paper", JSON.stringify(data));
+  attachments.forEach((file) => formData.append("attachments", file));
   return formData;
 }
 
@@ -312,12 +344,29 @@ export const api = {
   papers: {
     list: () => fetchApi<Paper[]>("/papers"),
     get: (id: number) => fetchApi<Paper>(`/papers/${id}`),
-    create: (data: PaperCreateInput) =>
-      fetchApi<Paper>("/papers", { method: "POST", body: JSON.stringify(data) }),
+    create: (data: PaperCreateInput, attachments: File[] = []) =>
+      fetchMultipart<Paper>("/papers", paperFormData(data, attachments)),
     update: (id: number, data: PaperUpdateInput) =>
       fetchApi<Paper>(`/papers/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+    updateWithAttachments: (
+      id: number,
+      data: PaperUpdateInput & { deleteAttachmentIds: number[] },
+      attachments: File[] = [],
+    ) => fetchMultipart<Paper>(`/papers/${id}`, paperUpdateFormData(data, attachments), "PATCH"),
     delete: (id: number) => fetchApi<{ success: boolean }>(`/papers/${id}`, { method: "DELETE" }),
     incrementViews: (id: number) => fetchApi<{ success: boolean }>(`/papers/${id}/views`, { method: "PATCH" }),
+    addAttachments: (id: number, attachments: File[]) =>
+      fetchMultipart<Paper>(`/papers/${id}/attachments`, paperAttachmentsFormData(attachments)),
+    replaceAttachment: (attachmentId: number, attachment: File) =>
+      fetchMultipart<PaperAttachment>(
+        `/paper-attachments/${attachmentId}`,
+        paperAttachmentsFormData([attachment], "attachment"),
+        "PUT",
+      ),
+    deleteAttachment: (attachmentId: number) =>
+      fetchApi<{ success: boolean }>(`/paper-attachments/${attachmentId}`, { method: "DELETE" }),
+    attachmentDownloadUrl: (attachment: Pick<PaperAttachment, "id" | "downloadUrl">) =>
+      attachment.downloadUrl || `${API_BASE}/paper-attachments/${attachment.id}/download`,
   },
   photos: {
     list: () => fetchApi<PhotoAlbum[]>("/photos"),

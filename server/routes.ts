@@ -12,8 +12,18 @@ import {
   type IStorage,
   type PhotoAlbumWithImages,
   type PhotoImageMetadata,
+  type PaperAttachmentMetadata,
+  type PaperWithAttachments,
   type StoredPhotoImageInput,
 } from "./storage";
+import {
+  MAX_PAPER_ATTACHMENTS,
+  MAX_PAPER_TOTAL_ATTACHMENT_BYTES,
+  PaperAttachmentContentError,
+  paperAttachmentArrayUpload,
+  paperAttachmentSingleUpload,
+  preparePaperAttachmentFiles,
+} from "./paper-attachments";
 import {
   auditEvent,
   hashPassword,
@@ -87,6 +97,16 @@ const photoInlineImageLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 600,
   message: "사진 조회 요청이 너무 많습니다. 잠시 후 다시 시도해주세요",
+});
+const paperAttachmentUploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: "논문 첨부파일 업로드 요청이 너무 많습니다. 잠시 후 다시 시도해주세요",
+});
+const paperAttachmentDownloadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 120,
+  message: "첨부파일 다운로드 요청이 너무 많습니다. 잠시 후 다시 시도해주세요",
 });
 const photoImageRateLimit: RequestHandler = (req, res, next) => {
   const limiter = req.query.download === "1" ? photoDownloadLimiter : photoInlineImageLimiter;
@@ -162,6 +182,7 @@ function createPhotoWorkConcurrencyGuard(options: {
 }): RequestHandler {
   let activeWork = 0;
   return (req, res, next) => {
+    if (req.aborted || res.destroyed || res.writableEnded) return;
     if (activeWork >= options.maxConcurrent) {
       auditEvent(req, options.auditAction);
       res.setHeader("Cache-Control", "no-store, max-age=0");
@@ -222,6 +243,22 @@ const photoArchiveConcurrency = createPhotoWorkConcurrencyGuard({
   auditAction: "photo_archive.concurrent_rejected",
   error: "다른 사진 묶음을 생성 중입니다. 잠시 후 다시 시도해주세요",
   code: "PHOTO_ARCHIVE_BUSY",
+});
+const PAPER_ATTACHMENT_UPLOAD_LEASE_KEY = "paperAttachmentUploadConcurrencyLease";
+const PAPER_ATTACHMENT_DOWNLOAD_LEASE_KEY = "paperAttachmentDownloadConcurrencyLease";
+const paperAttachmentUploadConcurrency = createPhotoWorkConcurrencyGuard({
+  maxConcurrent: 1,
+  leaseKey: PAPER_ATTACHMENT_UPLOAD_LEASE_KEY,
+  auditAction: "paper_attachment_upload.concurrent_rejected",
+  error: "다른 논문 첨부파일을 처리 중입니다. 잠시 후 다시 시도해주세요",
+  code: "PAPER_ATTACHMENT_UPLOAD_BUSY",
+});
+const paperAttachmentDownloadConcurrency = createPhotoWorkConcurrencyGuard({
+  maxConcurrent: 4,
+  leaseKey: PAPER_ATTACHMENT_DOWNLOAD_LEASE_KEY,
+  auditAction: "paper_attachment_download.concurrent_rejected",
+  error: "다른 첨부파일을 전송 중입니다. 잠시 후 다시 시도해주세요",
+  code: "PAPER_ATTACHMENT_DOWNLOAD_BUSY",
 });
 
 const usernameSchema = z.string().trim().min(4).max(32).regex(/^[A-Za-z0-9._-]+$/);
@@ -291,6 +328,19 @@ const paperUpdateSchema = paperCreateSchema
   .omit({ date: true })
   .partial()
   .refine(value => Object.keys(value).length > 0);
+const emptyLegacyPaperFilesSchema = z.array(z.never()).max(0).optional();
+const paperMultipartCreateSchema = paperCreateSchema
+  .omit({ files: true })
+  .extend({ files: emptyLegacyPaperFilesSchema })
+  .strict();
+const paperMultipartUpdateSchema = paperCreateSchema
+  .omit({ date: true, files: true })
+  .partial()
+  .extend({
+    files: emptyLegacyPaperFilesSchema,
+    deleteAttachmentIds: z.array(z.number().int().positive()).max(MAX_PAPER_ATTACHMENTS).default([]),
+  })
+  .strict();
 
 const httpsAttachmentSchema = z.string().trim().max(2_048).refine(value => {
   try {
@@ -336,6 +386,44 @@ const asyncHandler = (handler: AsyncRoute): RequestHandler => (req, res, next) =
 
 function parseBody<T extends z.ZodTypeAny>(schema: T, req: Request, res: Response): z.infer<T> | null {
   const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: "입력값을 확인해주세요",
+      code: "VALIDATION_ERROR",
+      fields: parsed.error.issues.slice(0, 5).map(issue => issue.path.join(".")),
+    });
+    return null;
+  }
+  return parsed.data;
+}
+
+function parseMultipartJson<T extends z.ZodTypeAny>(
+  schema: T,
+  field: string,
+  req: Request,
+  res: Response,
+): z.infer<T> | null {
+  const value = req.body?.[field];
+  if (typeof value !== "string" || value.length > 64 * 1024) {
+    res.status(400).json({
+      error: "논문 정보를 확인해주세요",
+      code: "VALIDATION_ERROR",
+      fields: [field],
+    });
+    return null;
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(value);
+  } catch {
+    res.status(400).json({
+      error: "논문 정보를 확인해주세요",
+      code: "VALIDATION_ERROR",
+      fields: [field],
+    });
+    return null;
+  }
+  const parsed = schema.safeParse(body);
   if (!parsed.success) {
     res.status(400).json({
       error: "입력값을 확인해주세요",
@@ -435,6 +523,52 @@ function publicPhotoAlbum(record: PhotoAlbumWithImages, includeImages: boolean) 
     : summary;
 }
 
+function publicPaperAttachment(attachment: PaperAttachmentMetadata) {
+  return {
+    id: attachment.id,
+    paperId: attachment.paperId,
+    fileName: attachment.fileName,
+    mimeType: attachment.mimeType,
+    byteSize: attachment.byteSize,
+    sortOrder: attachment.sortOrder,
+    createdAt: attachment.createdAt,
+    downloadUrl: `/api/paper-attachments/${attachment.id}/download`,
+  };
+}
+
+function publicPaper(paper: PaperWithAttachments) {
+  return {
+    ...paper,
+    attachments: paper.attachments.map(publicPaperAttachment),
+  };
+}
+
+function paperAttachmentFiles(req: Request): Express.Multer.File[] {
+  return (req.files as Express.Multer.File[] | undefined) ?? [];
+}
+
+function requirePaperAttachmentFiles(req: Request, res: Response): Express.Multer.File[] | null {
+  const files = paperAttachmentFiles(req);
+  if (!files.length) {
+    res.status(400).json({
+      error: "첨부파일을 한 개 이상 선택해주세요",
+      code: "PAPER_ATTACHMENT_REQUIRED",
+    });
+    return null;
+  }
+  return files;
+}
+
+function sendPaperAttachmentContentError(res: Response, error: unknown): boolean {
+  if (!(error instanceof PaperAttachmentContentError)) return false;
+  res.status(400).json({ error: error.message, code: error.code });
+  return true;
+}
+
+function exceedsPaperAttachmentTotal(files: { byteSize: number }[]): boolean {
+  return files.reduce((sum, file) => sum + file.byteSize, 0) > MAX_PAPER_TOTAL_ATTACHMENT_BYTES;
+}
+
 function hasValidPhotoMagic(file: Express.Multer.File): boolean {
   const bytes = file.buffer;
   const extension = path.extname(file.originalname).toLowerCase();
@@ -455,8 +589,13 @@ function hasValidPhotoMagic(file: Express.Multer.File): boolean {
 }
 
 function safePhotoFileName(originalName: string, fallbackIndex: number): string {
-  const extension = path.extname(originalName);
-  const rawStem = path.basename(originalName, extension).normalize("NFKC");
+  const decodedName = originalName.split("").every(character => character.charCodeAt(0) <= 0xff)
+    ? Buffer.from(originalName, "latin1").toString("utf8")
+    : originalName;
+  const usableName = decodedName.includes("\ufffd") ? originalName : decodedName;
+  const basename = path.posix.basename(usableName.replace(/\\/g, "/"));
+  const extension = path.extname(basename);
+  const rawStem = path.basename(basename, extension).normalize("NFKC");
   const sanitizedStem = rawStem
     .replace(/[\u0000-\u001f\u007f/\\<>:"|?*]+/g, "-")
     .replace(/\s+/g, " ")
@@ -1357,8 +1496,151 @@ export async function registerRoutes(httpServer: Server, app: Express, storageOv
     return res.json({ success: true });
   }));
 
+  app.get("/api/paper-attachments/:id/download", paperAttachmentDownloadLimiter, paperAttachmentDownloadConcurrency, asyncHandler(async (req, res) => {
+    const releaseDownload = beginPhotoWork(res, PAPER_ATTACHMENT_DOWNLOAD_LEASE_KEY);
+    try {
+      const id = parseId(req, res);
+      if (!id) return;
+      const attachment = await storage.getPaperAttachment(id);
+      if (res.destroyed) return;
+      if (!attachment) {
+        return res.status(404).json({ error: "첨부파일을 찾을 수 없습니다", code: "PAPER_ATTACHMENT_NOT_FOUND" });
+      }
+      res.setHeader("Cache-Control", "private, no-store, max-age=0");
+      res.setHeader("Pragma", "no-cache");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.setHeader("Content-Length", String(attachment.byteSize));
+      res.attachment(attachment.fileName);
+      res.type(attachment.mimeType);
+      auditEvent(req, "paper_attachment.download", `paper_attachment:${id}`);
+      const responseDone = new Promise<void>(resolve => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        res.once("finish", finish);
+        res.once("close", finish);
+        res.once("error", finish);
+      });
+      res.send(attachment.data);
+      await responseDone;
+    } finally {
+      releaseDownload();
+    }
+  }));
+
+  app.post(
+    "/api/papers/:id/attachments",
+    adminOnly,
+    paperAttachmentUploadConcurrency,
+    paperAttachmentUploadLimiter,
+    paperAttachmentArrayUpload,
+    asyncHandler(async (req, res) => {
+      const releaseUpload = beginPhotoWork(res, PAPER_ATTACHMENT_UPLOAD_LEASE_KEY);
+      try {
+        const id = parseId(req, res);
+        const files = requirePaperAttachmentFiles(req, res);
+        if (!id || !files) return;
+        const attachments = await preparePaperAttachmentFiles(files);
+        if (exceedsPaperAttachmentTotal(attachments)) {
+          return res.status(400).json({
+            error: "논문 한 건의 전체 첨부파일 크기는 30MB를 초과할 수 없습니다",
+            code: "PAPER_ATTACHMENTS_TOO_LARGE",
+          });
+        }
+        const result = await storage.addPaperAttachments(
+          id,
+          attachments,
+          MAX_PAPER_TOTAL_ATTACHMENT_BYTES,
+          MAX_PAPER_ATTACHMENTS,
+        );
+        if (result.status === "not_found") {
+          return res.status(404).json({ error: "논문을 찾을 수 없습니다", code: "PAPER_NOT_FOUND" });
+        }
+        if (result.status === "paper_full") {
+          return res.status(400).json({
+            error: "논문 한 건에는 최대 5개의 파일을 첨부할 수 있습니다",
+            code: "PAPER_ATTACHMENTS_FULL",
+          });
+        }
+        if (result.status === "paper_too_large") {
+          return res.status(400).json({
+            error: "논문 한 건의 전체 첨부파일 크기는 30MB를 초과할 수 없습니다",
+            code: "PAPER_ATTACHMENTS_TOO_LARGE",
+          });
+        }
+        auditEvent(req, "paper_attachments.create", `paper:${id};attachments:${attachments.length}`);
+        res.setHeader("Cache-Control", "no-store, max-age=0");
+        return res.status(201).json(publicPaper(result.paper));
+      } catch (error) {
+        if (sendPaperAttachmentContentError(res, error)) return;
+        throw error;
+      } finally {
+        releaseUpload();
+      }
+    }),
+  );
+
+  app.put(
+    "/api/paper-attachments/:id",
+    adminOnly,
+    paperAttachmentUploadConcurrency,
+    paperAttachmentUploadLimiter,
+    paperAttachmentSingleUpload,
+    asyncHandler(async (req, res) => {
+      const releaseUpload = beginPhotoWork(res, PAPER_ATTACHMENT_UPLOAD_LEASE_KEY);
+      try {
+        const id = parseId(req, res);
+        const file = req.file;
+        if (!id) return;
+        if (!file) {
+          return res.status(400).json({
+            error: "교체할 첨부파일을 선택해주세요",
+            code: "PAPER_ATTACHMENT_REQUIRED",
+          });
+        }
+        const [attachment] = await preparePaperAttachmentFiles([file]);
+        const result = await storage.replacePaperAttachment(
+          id,
+          attachment,
+          MAX_PAPER_TOTAL_ATTACHMENT_BYTES,
+        );
+        if (result.status === "not_found") {
+          return res.status(404).json({ error: "첨부파일을 찾을 수 없습니다", code: "PAPER_ATTACHMENT_NOT_FOUND" });
+        }
+        if (result.status === "paper_too_large") {
+          return res.status(400).json({
+            error: "논문 한 건의 전체 첨부파일 크기는 30MB를 초과할 수 없습니다",
+            code: "PAPER_ATTACHMENTS_TOO_LARGE",
+          });
+        }
+        auditEvent(req, "paper_attachment.replace", `paper_attachment:${id}`);
+        res.setHeader("Cache-Control", "no-store, max-age=0");
+        return res.json(publicPaperAttachment(result.attachment));
+      } catch (error) {
+        if (sendPaperAttachmentContentError(res, error)) return;
+        throw error;
+      } finally {
+        releaseUpload();
+      }
+    }),
+  );
+
+  app.delete("/api/paper-attachments/:id", adminOnly, publicContentMutationLimiter, asyncHandler(async (req, res) => {
+    const id = parseId(req, res);
+    if (!id) return;
+    if (!await storage.deletePaperAttachment(id)) {
+      return res.status(404).json({ error: "첨부파일을 찾을 수 없습니다", code: "PAPER_ATTACHMENT_NOT_FOUND" });
+    }
+    auditEvent(req, "paper_attachment.delete", `paper_attachment:${id}`);
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    return res.json({ success: true });
+  }));
+
   app.get("/api/papers", asyncHandler(async (_req, res) => {
-    return res.json(await storage.getPapers());
+    return res.json((await storage.getPapers()).map(publicPaper));
   }));
 
   app.get("/api/papers/:id", asyncHandler(async (req, res) => {
@@ -1366,26 +1648,113 @@ export async function registerRoutes(httpServer: Server, app: Express, storageOv
     if (!id) return;
     const paper = await storage.getPaper(id);
     if (!paper) return res.status(404).json({ error: "논문을 찾을 수 없습니다", code: "PAPER_NOT_FOUND" });
-    return res.json(paper);
+    return res.json(publicPaper(paper));
   }));
 
-  app.post("/api/papers", adminOnly, publicContentMutationLimiter, asyncHandler(async (req, res) => {
-    const input = parseBody(paperCreateSchema, req, res);
-    if (!input) return;
-    const paper = await storage.createPaper({ ...input, views: 0 });
-    auditEvent(req, "paper.create", `paper:${paper.id}`);
-    return res.status(201).json(paper);
-  }));
+  app.post("/api/papers", adminOnly, paperAttachmentUploadConcurrency, paperAttachmentUploadLimiter, publicContentMutationLimiter, paperAttachmentArrayUpload,
+    asyncHandler(async (req, res) => {
+      const releaseUpload = beginPhotoWork(res, PAPER_ATTACHMENT_UPLOAD_LEASE_KEY);
+      try {
+        const multipart = req.is("multipart/form-data");
+        const input = multipart
+          ? parseMultipartJson(paperMultipartCreateSchema, "paper", req, res)
+          : parseBody(paperCreateSchema, req, res);
+        if (!input) return;
+        const attachments = multipart
+          ? await preparePaperAttachmentFiles(paperAttachmentFiles(req))
+          : [];
+        if (exceedsPaperAttachmentTotal(attachments)) {
+          return res.status(400).json({
+            error: "논문 한 건의 전체 첨부파일 크기는 30MB를 초과할 수 없습니다",
+            code: "PAPER_ATTACHMENTS_TOO_LARGE",
+          });
+        }
+        const legacyFiles = "files" in input && Array.isArray(input.files)
+          ? input.files.filter((file): file is string => typeof file === "string")
+          : [];
+        const paper = await storage.createPaper({ ...input, files: legacyFiles, views: 0 }, attachments);
+        auditEvent(req, "paper.create", `paper:${paper.id};attachments:${attachments.length}`);
+        res.setHeader("Cache-Control", "no-store, max-age=0");
+        return res.status(201).json(publicPaper(paper));
+      } catch (error) {
+        if (sendPaperAttachmentContentError(res, error)) return;
+        throw error;
+      } finally {
+        releaseUpload();
+      }
+    }),
+  );
 
-  app.patch("/api/papers/:id", adminOnly, publicContentMutationLimiter, asyncHandler(async (req, res) => {
-    const id = parseId(req, res);
-    const input = parseBody(paperUpdateSchema, req, res);
-    if (!id || !input) return;
-    const paper = await storage.updatePaper(id, input);
-    if (!paper) return res.status(404).json({ error: "논문을 찾을 수 없습니다", code: "PAPER_NOT_FOUND" });
-    auditEvent(req, "paper.update", `paper:${id}`);
-    return res.json(paper);
-  }));
+  app.patch("/api/papers/:id", adminOnly, paperAttachmentUploadConcurrency, paperAttachmentUploadLimiter, publicContentMutationLimiter, paperAttachmentArrayUpload,
+    asyncHandler(async (req, res) => {
+      const releaseUpload = beginPhotoWork(res, PAPER_ATTACHMENT_UPLOAD_LEASE_KEY);
+      try {
+        const id = parseId(req, res);
+        if (!id) return;
+        const multipart = req.is("multipart/form-data");
+        if (!multipart) {
+          const input = parseBody(paperUpdateSchema, req, res);
+          if (!input) return;
+          const paper = await storage.updatePaper(id, input);
+          if (!paper) return res.status(404).json({ error: "논문을 찾을 수 없습니다", code: "PAPER_NOT_FOUND" });
+          auditEvent(req, "paper.update", `paper:${id}`);
+          return res.json(publicPaper(paper));
+        }
+
+        const input = parseMultipartJson(paperMultipartUpdateSchema, "paper", req, res);
+        if (!input) return;
+        const { deleteAttachmentIds, ...paperChanges } = input;
+        const attachments = await preparePaperAttachmentFiles(paperAttachmentFiles(req));
+        if (!Object.keys(paperChanges).length && !deleteAttachmentIds.length && !attachments.length) {
+          return res.status(400).json({
+            error: "수정할 논문 정보 또는 첨부파일을 선택해주세요",
+            code: "VALIDATION_ERROR",
+          });
+        }
+        const result = await storage.updatePaperWithAttachments(
+          id,
+          paperChanges,
+          attachments,
+          deleteAttachmentIds,
+          MAX_PAPER_TOTAL_ATTACHMENT_BYTES,
+          MAX_PAPER_ATTACHMENTS,
+        );
+        if (result.status === "not_found") {
+          return res.status(404).json({ error: "논문을 찾을 수 없습니다", code: "PAPER_NOT_FOUND" });
+        }
+        if (result.status === "attachment_not_found") {
+          return res.status(400).json({
+            error: "삭제할 첨부파일이 현재 논문에 포함되어 있는지 확인해주세요",
+            code: "PAPER_ATTACHMENT_NOT_FOUND",
+          });
+        }
+        if (result.status === "paper_full") {
+          return res.status(400).json({
+            error: "논문 한 건에는 최대 5개의 파일을 첨부할 수 있습니다",
+            code: "PAPER_ATTACHMENTS_FULL",
+          });
+        }
+        if (result.status === "paper_too_large") {
+          return res.status(400).json({
+            error: "논문 한 건의 전체 첨부파일 크기는 30MB를 초과할 수 없습니다",
+            code: "PAPER_ATTACHMENTS_TOO_LARGE",
+          });
+        }
+        auditEvent(
+          req,
+          "paper.update",
+          `paper:${id};attachments_added:${attachments.length};attachments_deleted:${deleteAttachmentIds.length}`,
+        );
+        res.setHeader("Cache-Control", "no-store, max-age=0");
+        return res.json(publicPaper(result.paper));
+      } catch (error) {
+        if (sendPaperAttachmentContentError(res, error)) return;
+        throw error;
+      } finally {
+        releaseUpload();
+      }
+    }),
+  );
 
   app.delete("/api/papers/:id", adminOnly, publicContentMutationLimiter, asyncHandler(async (req, res) => {
     const id = parseId(req, res);

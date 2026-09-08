@@ -1,5 +1,7 @@
 import {
+  type DragEvent,
   type FormEvent,
+  type RefObject,
   useEffect,
   useMemo,
   useRef,
@@ -63,6 +65,7 @@ import { toast } from "sonner";
 
 const ITEMS_PER_PAGE = 9;
 const MAX_IMAGES = 12;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
 type PhotoSearchScope = "all" | "title" | "content";
 const SHARED_RESOURCES_URL = "https://drive.google.com/drive/folders/1WoLoXcT7wRbpyxldRxXyyMKYTuZR0k4L?usp=drive_link";
 const acceptedImageTypes = new Set(["image/jpeg", "image/png", "image/webp"]);
@@ -101,10 +104,29 @@ const validateImages = (files: File[], existingCount = 0) => {
   if (files.some((file) => !isAcceptedImage(file))) {
     return "JPG, PNG, WebP 형식의 사진만 등록할 수 있습니다.";
   }
+  if (files.some((file) => file.size === 0)) {
+    return "내용이 없는 사진 파일은 등록할 수 없습니다.";
+  }
+  if (files.some((file) => file.size > MAX_IMAGE_BYTES)) {
+    return "사진 한 장의 최대 크기는 8MB입니다.";
+  }
   if (existingCount + files.length > MAX_IMAGES) {
     return `앨범당 사진은 최대 ${MAX_IMAGES}장까지 등록할 수 있습니다.`;
   }
   return null;
+};
+
+const mergeUniqueFiles = (current: File[], added: File[]) => {
+  const seen = new Set(current.map((file) => `${file.name}\u0000${file.size}\u0000${file.lastModified}\u0000${file.type}`));
+  return [
+    ...current,
+    ...added.filter((file) => {
+      const key = `${file.name}\u0000${file.size}\u0000${file.lastModified}\u0000${file.type}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }),
+  ];
 };
 
 const previewTitles = [
@@ -275,6 +297,122 @@ function SelectedFileList({ files, onRemove, disabled }: SelectedFileListProps) 
   );
 }
 
+type ImageDropzoneProps = {
+  id: string;
+  testId: string;
+  inputRef: RefObject<HTMLInputElement | null>;
+  disabled: boolean;
+  selectedCount: number;
+  helperText: string;
+  onFiles: (files: File[]) => void;
+};
+
+function ImageDropzone({
+  id,
+  testId,
+  inputRef,
+  disabled,
+  selectedCount,
+  helperText,
+  onFiles,
+}: ImageDropzoneProps) {
+  const [isDragging, setIsDragging] = useState(false);
+  const dragDepthRef = useRef(0);
+  const helperId = `${id}-helper`;
+  const statusId = `${id}-status`;
+
+  useEffect(() => {
+    if (!disabled) return;
+    dragDepthRef.current = 0;
+    setIsDragging(false);
+  }, [disabled]);
+
+  const hasFiles = (event: DragEvent<HTMLButtonElement>) =>
+    Array.from(event.dataTransfer.types).includes("Files");
+
+  const handleDragEnter = (event: DragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (disabled || !hasFiles(event)) return;
+    dragDepthRef.current += 1;
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (event: DragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (disabled) return;
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (dragDepthRef.current === 0) setIsDragging(false);
+  };
+
+  const handleDrop = (event: DragEvent<HTMLButtonElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepthRef.current = 0;
+    setIsDragging(false);
+    if (disabled) return;
+    const droppedFiles = Array.from(event.dataTransfer.files);
+    if (droppedFiles.length > 0) onFiles(droppedFiles);
+  };
+
+  return (
+    <>
+      <input
+        ref={inputRef}
+        id={id}
+        type="file"
+        accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
+        multiple
+        disabled={disabled}
+        onChange={(event) => {
+          const selectedFiles = Array.from(event.target.files ?? []);
+          if (selectedFiles.length > 0) onFiles(selectedFiles);
+          event.currentTarget.value = "";
+        }}
+        className="hidden"
+        data-testid={`${testId}-input`}
+      />
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => inputRef.current?.click()}
+        onDragEnter={handleDragEnter}
+        onDragOver={(event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          if (!disabled && hasFiles(event)) event.dataTransfer.dropEffect = "copy";
+        }}
+        onDragLeave={handleDragLeave}
+        onDragEnd={() => {
+          dragDepthRef.current = 0;
+          setIsDragging(false);
+        }}
+        onDrop={handleDrop}
+        aria-describedby={`${helperId} ${statusId}`}
+        className={`group flex min-h-36 w-full flex-col items-center justify-center rounded-[10px] border-2 border-dashed px-5 py-6 text-center transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#2156D9] focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60 ${
+          isDragging
+            ? "border-[#2156D9] bg-blue-50 ring-2 ring-[#2156D9]/20"
+            : "border-slate-300 bg-white hover:border-[#2156D9] hover:bg-blue-50/50"
+        }`}
+        data-testid={testId}
+        data-drop-active={isDragging ? "true" : "false"}
+      >
+        <span className={`flex h-11 w-11 items-center justify-center rounded-full transition-colors ${isDragging ? "bg-[#2156D9] text-white" : "bg-blue-50 text-[#2156D9] group-hover:bg-blue-100"}`}>
+          <Upload className="h-5 w-5" aria-hidden="true" />
+        </span>
+        <span className="mt-3 text-sm font-extrabold text-slate-800">
+          {isDragging ? "사진을 여기에 놓아 주세요" : "사진을 드래그하거나 클릭해 선택하세요"}
+        </span>
+        <span id={helperId} className="mt-1 text-xs leading-5 text-slate-500">{helperText}</span>
+      </button>
+      <p id={statusId} className="text-xs leading-5 text-slate-500" role="status" aria-live="polite">
+        선택 {selectedCount}/{MAX_IMAGES}장
+      </p>
+    </>
+  );
+}
+
 type CreateAlbumDialogProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -296,13 +434,14 @@ function CreateAlbumDialog({ open, onOpenChange, onCreated }: CreateAlbumDialogP
   }, [open]);
 
   const chooseFiles = (selected: File[]) => {
-    const message = validateImages(selected);
+    const nextFiles = mergeUniqueFiles(files, selected);
+    const message = validateImages(nextFiles);
     if (message) {
       toast.error(message);
       if (fileInputRef.current) fileInputRef.current.value = "";
       return;
     }
-    setFiles(selected);
+    setFiles(nextFiles);
   };
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
@@ -344,22 +483,20 @@ function CreateAlbumDialog({ open, onOpenChange, onCreated }: CreateAlbumDialogP
           <AlbumFormFields form={form} onChange={setForm} prefix="create-photo" />
           <div className="space-y-2">
             <Label htmlFor="create-photo-files" className="font-bold">사진 파일</Label>
-            <Input
-              ref={fileInputRef}
+            <ImageDropzone
               id="create-photo-files"
-              type="file"
-              accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
-              multiple
+              testId="photo-create-dropzone"
+              inputRef={fileInputRef}
               disabled={saving}
-              onChange={(event) => chooseFiles(Array.from(event.target.files ?? []))}
-              className="h-11 cursor-pointer rounded-md file:mr-3 file:border-0 file:bg-transparent file:font-bold file:text-[#2156D9]"
+              selectedCount={files.length}
+              helperText="JPG·PNG·WebP, 최대 12장 · 파일당 8MB"
+              onFiles={chooseFiles}
             />
-            <p className="text-xs leading-5 text-slate-500" aria-live="polite">선택 {files.length}/{MAX_IMAGES}장</p>
             <SelectedFileList files={files} disabled={saving} onRemove={(index) => setFiles((current) => current.filter((_, itemIndex) => itemIndex !== index))} />
           </div>
-          <div className="flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
-            <Button type="button" variant="outline" disabled={saving} onClick={() => onOpenChange(false)} className="h-11 rounded-md px-6">취소</Button>
-            <Button type="submit" disabled={saving} className="h-11 rounded-md bg-[#2156D9] px-6 font-bold hover:bg-[#1848bc]">
+          <div className="sticky bottom-0 z-20 -mx-6 -mb-6 flex gap-3 border-t border-slate-200 bg-white px-6 pb-6 pt-4 shadow-[0_-8px_20px_rgba(15,23,42,0.06)]">
+            <Button type="button" variant="outline" disabled={saving} onClick={() => onOpenChange(false)} className="h-11 flex-1 rounded-md px-6">취소</Button>
+            <Button type="submit" disabled={saving} className="h-11 flex-1 rounded-md bg-[#2156D9] px-6 font-bold hover:bg-[#1848bc]">
               {saving ? <><LoaderCircle className="mr-2 h-4 w-4 animate-spin" />등록 중...</> : <><Upload className="mr-2 h-4 w-4" />앨범 등록</>}
             </Button>
           </div>
@@ -454,6 +591,11 @@ function PhotoList({ isAdmin }: { isAdmin: boolean }) {
   useEffect(() => {
     void loadAlbums();
   }, []);
+
+  useEffect(() => {
+    if (isAdmin) return;
+    setCreateOpen(false);
+  }, [isAdmin]);
 
   const filteredAlbums = useMemo(() => {
     const keyword = searchQuery.trim().toLocaleLowerCase("ko-KR");
@@ -729,6 +871,19 @@ function PhotoDetail({ albumId, isAdmin }: { albumId: number; isAdmin: boolean }
   }, [shouldReduceMotion]);
 
   useEffect(() => {
+    if (isAdmin) return;
+    setEditOpen(false);
+    setEditForm(emptyAlbumForm());
+    setAddFiles([]);
+    setDeleteAlbumOpen(false);
+    setDeleteImageId(null);
+    setSavingMetadata(false);
+    setImageBusy(false);
+    setDeletingAlbum(false);
+    if (addFilesRef.current) addFilesRef.current.value = "";
+  }, [isAdmin]);
+
+  useEffect(() => {
     const rail = thumbnailRailRef.current;
     const selected = rail?.querySelector<HTMLElement>(`[data-thumbnail-index="${currentIndex}"]`);
     if (!rail || !selected) return;
@@ -789,13 +944,14 @@ function PhotoDetail({ albumId, isAdmin }: { albumId: number; isAdmin: boolean }
   };
 
   const selectAdditionalFiles = (selected: File[]) => {
-    const message = validateImages(selected, images.length);
+    const nextFiles = mergeUniqueFiles(addFiles, selected);
+    const message = validateImages(nextFiles, images.length);
     if (message) {
       toast.error(message);
       if (addFilesRef.current) addFilesRef.current.value = "";
       return;
     }
-    setAddFiles(selected);
+    setAddFiles(nextFiles);
   };
 
   const uploadAdditionalImages = async () => {
@@ -1105,20 +1261,21 @@ function PhotoDetail({ albumId, isAdmin }: { albumId: number; isAdmin: boolean }
 
                 <div className="mt-6 rounded-md bg-slate-50 p-4">
                   <Label htmlFor="add-photo-files" className="font-bold">사진 추가</Label>
-                  <div className="mt-2 flex flex-col gap-2 sm:flex-row">
-                    <Input
-                      ref={addFilesRef}
+                  <div className="mt-2 space-y-3">
+                    <ImageDropzone
                       id="add-photo-files"
-                      type="file"
-                      accept="image/jpeg,image/png,image/webp,.jpg,.jpeg,.png,.webp"
-                      multiple
+                      testId="photo-edit-add-dropzone"
+                      inputRef={addFilesRef}
                       disabled={imageBusy || images.length >= MAX_IMAGES}
-                      onChange={(event) => selectAdditionalFiles(Array.from(event.target.files ?? []))}
-                      className="h-11 cursor-pointer rounded-md bg-white file:mr-3 file:border-0 file:bg-transparent file:font-bold file:text-[#2156D9]"
+                      selectedCount={addFiles.length}
+                      helperText={images.length >= MAX_IMAGES ? "앨범당 최대 사진 수에 도달했습니다." : `JPG·PNG·WebP, 최대 ${MAX_IMAGES - images.length}장 추가 · 파일당 8MB`}
+                      onFiles={selectAdditionalFiles}
                     />
-                    <Button type="button" onClick={() => void uploadAdditionalImages()} disabled={imageBusy || addFiles.length === 0} className="h-11 shrink-0 rounded-md bg-[#0B2B50] px-5 font-bold hover:bg-[#123b69]">
-                      {imageBusy ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Plus className="mr-2 h-4 w-4" />}사진 추가
-                    </Button>
+                    <div className="flex justify-end">
+                      <Button type="button" onClick={() => void uploadAdditionalImages()} disabled={imageBusy || addFiles.length === 0} className="h-11 shrink-0 rounded-md bg-[#0B2B50] px-5 font-bold hover:bg-[#123b69]">
+                        {imageBusy ? <LoaderCircle className="mr-2 h-4 w-4 animate-spin" /> : <Plus className="mr-2 h-4 w-4" />}선택한 사진 추가
+                      </Button>
+                    </div>
                   </div>
                   <SelectedFileList files={addFiles} disabled={imageBusy} onRemove={(index) => setAddFiles((current) => current.filter((_, itemIndex) => itemIndex !== index))} />
                 </div>

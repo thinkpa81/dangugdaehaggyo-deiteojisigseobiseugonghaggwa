@@ -69,3 +69,24 @@
 - 실제 운영 행사 사진을 첫 등록한 뒤 세로형·초광각 사진의 대표 이미지 크롭 초점만 콘텐츠별로 확인할 수 있다.
 
 final result: passed
+---
+
+# Design QA — 관리자 자료 업로드
+
+- Reference: 사용자가 제공한 780 × 728 논문 등록 대화상자
+- Prototype: 논문 등록/수정 첨부파일 UI, 사진 앨범 등록/수정 사진 UI
+- Desktop validation: 780 × 728 논문 등록 상태와 840px 사진 등록 상태
+- Mobile validation: 375 × 812 논문 및 사진 등록 상태
+- Interaction validation: 클릭 파일 선택, 다중 선택, 선택 파일명/용량 표시, 개별 제거, 등록/취소 동작 위치, 사진 수정 화면의 추가 파일 선택
+- Access validation: 관리자 세션에서만 등록·수정·삭제 UI가 렌더링되고, 비관리자 전환 시 열린 관리자 상태와 선택 파일을 초기화
+- Responsive validation: 375px 뷰포트에서 가로 넘침 없음; 긴 양식은 내부 스크롤을 사용하고 등록/취소 버튼은 하단에 고정
+- Visual validation: 기존 단국대 색상·타이포그래피·입력 높이·라운드·버튼 계층을 유지하면서 첨부 영역만 확장
+
+## Findings
+
+- P0: none
+- P1: none
+- P2: none
+- P3: 긴 파일명은 한 줄 말줄임으로 표시되며 전체 이름은 다운로드 응답의 원본 파일명으로 보존됨
+
+final result: passed
