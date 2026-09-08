@@ -96,6 +96,35 @@ export interface Paper {
 export type PaperCreateInput = Omit<Paper, "id" | "views">;
 export type PaperUpdateInput = Partial<Omit<PaperCreateInput, "date">>;
 
+export interface PhotoImage {
+  id: number;
+  albumId: number;
+  fileName: string;
+  mimeType: string;
+  byteSize: number;
+  width: number | null;
+  height: number | null;
+  sortOrder: number;
+  altText: string | null;
+  url?: string;
+  downloadUrl?: string;
+}
+
+export interface PhotoAlbum {
+  id: number;
+  title: string;
+  content: string;
+  organization: string;
+  date: string;
+  views: number;
+  imageCount: number;
+  coverImage: PhotoImage | null;
+  images?: PhotoImage[];
+  downloadUrl?: string;
+}
+
+export type PhotoAlbumInput = Pick<PhotoAlbum, "title" | "content" | "organization" | "date">;
+
 export interface Talent {
   id: number;
   name: string;
@@ -136,6 +165,39 @@ async function fetchApi<T>(url: string, options?: RequestInit): Promise<T> {
     throw new Error(errorMessage);
   }
   return res.json();
+}
+
+async function fetchMultipart<T>(url: string, formData: FormData, method: "POST" | "PATCH" = "POST"): Promise<T> {
+  const res = await fetch(`${API_BASE}${url}`, {
+    method,
+    body: formData,
+    credentials: "include",
+  });
+  if (!res.ok) {
+    let errorMessage = `서버 오류 (${res.status})`;
+    try {
+      const text = await res.text();
+      try {
+        const json = JSON.parse(text);
+        errorMessage = json.error || json.message || errorMessage;
+      } catch {
+        if (text) errorMessage = text.substring(0, 200);
+      }
+    } catch {
+      // 응답 본문을 읽을 수 없는 경우 기본 오류 문구를 사용합니다.
+    }
+    throw new Error(errorMessage);
+  }
+  return res.json();
+}
+
+function photoFormData(data: Partial<PhotoAlbumInput>, images: File[]) {
+  const formData = new FormData();
+  Object.entries(data).forEach(([key, value]) => {
+    if (value !== undefined) formData.append(key, value);
+  });
+  images.forEach((file) => formData.append("images", file));
+  return formData;
 }
 
 export interface UploadedFile {
@@ -256,6 +318,28 @@ export const api = {
       fetchApi<Paper>(`/papers/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
     delete: (id: number) => fetchApi<{ success: boolean }>(`/papers/${id}`, { method: "DELETE" }),
     incrementViews: (id: number) => fetchApi<{ success: boolean }>(`/papers/${id}/views`, { method: "PATCH" }),
+  },
+  photos: {
+    list: () => fetchApi<PhotoAlbum[]>("/photos"),
+    get: (id: number) => fetchApi<PhotoAlbum>(`/photos/${id}`),
+    create: (data: PhotoAlbumInput, images: File[]) =>
+      fetchMultipart<PhotoAlbum>("/photos", photoFormData(data, images)),
+    update: (id: number, data: Partial<PhotoAlbumInput>) =>
+      fetchApi<PhotoAlbum>(`/photos/${id}`, { method: "PATCH", body: JSON.stringify(data) }),
+    addImages: (id: number, images: File[]) =>
+      fetchMultipart<PhotoAlbum>(`/photos/${id}/images`, photoFormData({}, images)),
+    reorderImages: (id: number, imageIds: number[]) =>
+      fetchApi<PhotoAlbum>(`/photos/${id}/images/order`, { method: "PATCH", body: JSON.stringify({ imageIds }) }),
+    deleteImage: (imageId: number) =>
+      fetchApi<{ success: boolean }>(`/photo-images/${imageId}`, { method: "DELETE" }),
+    delete: (id: number) => fetchApi<{ success: boolean }>(`/photos/${id}`, { method: "DELETE" }),
+    incrementViews: (id: number) =>
+      fetchApi<{ success: boolean; views: number }>(`/photos/${id}/views`, { method: "PATCH" }),
+    imageUrl: (image: Pick<PhotoImage, "id" | "url">) => image.url || `${API_BASE}/photo-images/${image.id}`,
+    imageDownloadUrl: (image: Pick<PhotoImage, "id" | "downloadUrl">) =>
+      image.downloadUrl || `${API_BASE}/photo-images/${image.id}?download=1`,
+    albumDownloadUrl: (album: Pick<PhotoAlbum, "id" | "downloadUrl">) =>
+      album.downloadUrl || `${API_BASE}/photos/${album.id}/download`,
   },
   talents: {
     list: () => fetchApi<Talent[]>("/talents"),

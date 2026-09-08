@@ -11,7 +11,7 @@ import {
   Database,
   ExternalLink,
   GraduationCap,
-  LibraryBig,
+  Images,
   Megaphone,
   Network,
   Scale,
@@ -24,6 +24,7 @@ import { api, type Notice } from "@/lib/api";
 const resources = [
   { title: "학과 내규 및 학사 운영 기준", href: "/regulations", label: "학과 내규" },
   { title: "국내·외 학술 논문 및 연구 실적", href: "/papers", label: "논문" },
+  { title: "학과 교육·연구 활동 사진", href: "/photos", label: "사진" },
   {
     title: "데이터지식서비스공학과 공유 자료실",
     href: "https://drive.google.com/drive/folders/1WoLoXcT7wRbpyxldRxXyyMKYTuZR0k4L?usp=drive_link",
@@ -34,17 +35,12 @@ const resources = [
 ];
 
 const quickLinks = [
-  { icon: GraduationCap, title: "학과 소개", href: "/about" },
-  { icon: Megaphone, title: "공지사항", href: "/notices" },
-  { icon: BookOpen, title: "논문", href: "/papers" },
-  { icon: Scale, title: "학과 내규", href: "/regulations" },
-  { icon: ClipboardList, title: "입학안내", href: "/admissions/guidelines" },
-  {
-    icon: LibraryBig,
-    title: "자료실",
-    href: "https://drive.google.com/drive/folders/1WoLoXcT7wRbpyxldRxXyyMKYTuZR0k4L?usp=drive_link",
-    external: true,
-  },
+  { icon: GraduationCap, title: "학과 소개", href: "/about", external: false },
+  { icon: Megaphone, title: "공지사항", href: "/notices", external: false },
+  { icon: BookOpen, title: "논문", href: "/papers", external: false },
+  { icon: Scale, title: "학과 내규", href: "/regulations", external: false },
+  { icon: ClipboardList, title: "입학안내", href: "/admissions/guidelines", external: false },
+  { icon: Images, title: "사진자료실", href: "/photos", external: false },
 ];
 
 const programs = [
@@ -200,9 +196,9 @@ export default function Home() {
                   <p className="mb-1 text-xs font-bold tracking-[0.16em] text-[#2156D9]">RESOURCES</p>
                   <h2 className="text-2xl font-extrabold tracking-[-0.03em]">자료실</h2>
                 </div>
-                <a href="https://drive.google.com/drive/folders/1WoLoXcT7wRbpyxldRxXyyMKYTuZR0k4L?usp=drive_link" target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-sm font-bold text-slate-600 hover:text-[#2156D9]">
-                  전체보기 <ExternalLink className="h-3.5 w-3.5" />
-                </a>
+                <Link href="/photos" className="inline-flex items-center gap-1 text-sm font-bold text-slate-600 hover:text-[#2156D9]">
+                  전체보기 <ChevronRight className="h-4 w-4" />
+                </Link>
               </div>
               <div className="divide-y divide-slate-200">
                 {resources.map((resource) => {

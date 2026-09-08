@@ -138,6 +138,31 @@ export async function ensureTablesExist() {
         attachment_name TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS photo_albums (
+        id SERIAL PRIMARY KEY,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        organization TEXT NOT NULL,
+        date TEXT NOT NULL CHECK (date ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}$'),
+        views INTEGER NOT NULL DEFAULT 0 CHECK (views >= 0),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS photo_images (
+        id SERIAL PRIMARY KEY,
+        album_id INTEGER NOT NULL REFERENCES photo_albums(id) ON DELETE CASCADE,
+        file_name TEXT NOT NULL,
+        mime_type TEXT NOT NULL CHECK (mime_type = 'image/webp'),
+        byte_size INTEGER NOT NULL CHECK (byte_size > 0 AND byte_size <= 3145728),
+        width INTEGER NOT NULL CHECK (width > 0 AND width <= 2000),
+        height INTEGER NOT NULL CHECK (height > 0 AND height <= 1500),
+        sort_order INTEGER NOT NULL CHECK (sort_order >= 0),
+        alt_text TEXT NOT NULL,
+        image_data BYTEA NOT NULL CHECK (octet_length(image_data) = byte_size),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
       CREATE TABLE IF NOT EXISTS app_migrations (
         id TEXT PRIMARY KEY,
         applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -157,6 +182,8 @@ export async function ensureTablesExist() {
       CREATE INDEX IF NOT EXISTS idx_notice_comments_user_id ON notice_comments(user_id);
       CREATE INDEX IF NOT EXISTS idx_paper_comments_user_id ON paper_comments(user_id);
       CREATE INDEX IF NOT EXISTS idx_admission_guidelines_date ON admission_guidelines(date DESC);
+      CREATE INDEX IF NOT EXISTS idx_photo_albums_date ON photo_albums(date DESC, id DESC);
+      CREATE INDEX IF NOT EXISTS idx_photo_images_album_order ON photo_images(album_id, sort_order, id);
 
       UPDATE admission_guidelines
       SET date = replace(date, '.', '-')

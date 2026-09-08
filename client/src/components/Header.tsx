@@ -13,7 +13,14 @@ import dkuLogo from "@assets/image_1767877726952.png";
 import { api } from "@/lib/api";
 import { notifyAuthChanged, useSession } from "@/hooks/use-session";
 
-const navItems = [
+type NavItem = {
+  title: string;
+  href: string;
+  external?: boolean;
+  children?: NavItem[];
+};
+
+const navItems: NavItem[] = [
   { title: "학과 소개", href: "/about" },
   { title: "공지사항", href: "/notices" },
   {
@@ -34,8 +41,15 @@ const navItems = [
   },
   {
     title: "자료",
-    href: "https://drive.google.com/drive/folders/1WoLoXcT7wRbpyxldRxXyyMKYTuZR0k4L?usp=drive_link",
-    external: true,
+    href: "/photos",
+    children: [
+      { title: "사진자료실", href: "/photos" },
+      {
+        title: "공유자료실",
+        href: "https://drive.google.com/drive/folders/1WoLoXcT7wRbpyxldRxXyyMKYTuZR0k4L?usp=drive_link",
+        external: true,
+      },
+    ],
   },
 ];
 
@@ -43,6 +57,9 @@ export default function Header() {
   const [location] = useLocation();
   const [mobileOpen, setMobileOpen] = useState(false);
   const { user: sessionUser } = useSession();
+
+  const isActiveHref = (href: string) =>
+    !href.startsWith("http") && (location === href || (href !== "/" && location.startsWith(`${href}/`)));
 
   const movePageToTop = () => {
     window.scrollTo({ top: 0, left: 0, behavior: "instant" });
@@ -93,8 +110,8 @@ export default function Header() {
         <nav className="hidden items-stretch self-stretch xl:flex" aria-label="주요 메뉴">
           {navItems.map((item) => {
             const active = item.children
-              ? location === item.href || item.children.some((child) => location === child.href)
-              : location === item.href;
+              ? isActiveHref(item.href) || item.children.some((child) => isActiveHref(child.href))
+              : isActiveHref(item.href);
             const baseClass = `relative flex h-full items-center border-b-[3px] px-4 pt-[3px] text-[15px] font-bold transition-colors ${active ? "border-[#2156D9] text-[#2156D9]" : "border-transparent text-slate-700 hover:border-slate-300 hover:text-[#2156D9]"}`;
 
             if (item.children) {
@@ -108,14 +125,26 @@ export default function Header() {
                   <DropdownMenuContent align="start" className="w-52 rounded-md border-slate-200 p-2 shadow-xl">
                     {item.children.map((child) => (
                       <DropdownMenuItem key={child.title} asChild className="rounded-sm py-2.5">
-                        <Link
-                          href={child.href}
-                          className={`cursor-pointer font-medium ${location === child.href ? "text-[#2156D9]" : ""}`}
-                          aria-current={location === child.href ? "page" : undefined}
-                          data-testid={`nav-${child.title}`}
-                        >
-                          {child.title}
-                        </Link>
+                        {child.external ? (
+                          <a
+                            href={child.href}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="cursor-pointer font-medium"
+                            data-testid={`nav-${child.title}`}
+                          >
+                            {child.title}
+                          </a>
+                        ) : (
+                          <Link
+                            href={child.href}
+                            className={`cursor-pointer font-medium ${isActiveHref(child.href) ? "text-[#2156D9]" : ""}`}
+                            aria-current={isActiveHref(child.href) ? "page" : undefined}
+                            data-testid={`nav-${child.title}`}
+                          >
+                            {child.title}
+                          </Link>
+                        )}
                       </DropdownMenuItem>
                     ))}
                   </DropdownMenuContent>
@@ -150,8 +179,8 @@ export default function Header() {
             <nav className="mt-5 flex flex-col" aria-label="모바일 주요 메뉴">
               {navItems.map((item) => {
                 const active = item.children
-                  ? location === item.href || item.children.some((child) => location === child.href)
-                  : location === item.href;
+                  ? isActiveHref(item.href) || item.children.some((child) => isActiveHref(child.href))
+                  : isActiveHref(item.href);
                 return (
                 <div key={item.title} className="border-b border-slate-100 py-1">
                   {item.external ? (
@@ -162,16 +191,30 @@ export default function Header() {
                   {item.children && (
                     <div className="mb-2 grid grid-cols-1 gap-1 rounded-md bg-slate-50 p-2">
                       {item.children.map((child) => (
-                        <Link
-                          key={child.title}
-                          href={child.href}
-                          onClick={handleMobileInternalLink}
-                          className={`rounded-sm px-2 py-2 text-sm font-medium hover:bg-white hover:text-[#2156D9] ${location === child.href ? "bg-white text-[#2156D9]" : "text-slate-600"}`}
-                          aria-current={location === child.href ? "page" : undefined}
-                          data-testid={`mobile-nav-${child.title}`}
-                        >
-                          {child.title}
-                        </Link>
+                        child.external ? (
+                          <a
+                            key={child.title}
+                            href={child.href}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={() => setMobileOpen(false)}
+                            className="rounded-sm px-2 py-2 text-sm font-medium text-slate-600 hover:bg-white hover:text-[#2156D9]"
+                            data-testid={`mobile-nav-${child.title}`}
+                          >
+                            {child.title}
+                          </a>
+                        ) : (
+                          <Link
+                            key={child.title}
+                            href={child.href}
+                            onClick={handleMobileInternalLink}
+                            className={`rounded-sm px-2 py-2 text-sm font-medium hover:bg-white hover:text-[#2156D9] ${isActiveHref(child.href) ? "bg-white text-[#2156D9]" : "text-slate-600"}`}
+                            aria-current={isActiveHref(child.href) ? "page" : undefined}
+                            data-testid={`mobile-nav-${child.title}`}
+                          >
+                            {child.title}
+                          </Link>
+                        )
                       ))}
                     </div>
                   )}
