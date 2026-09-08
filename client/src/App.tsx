@@ -11,6 +11,7 @@ import Notices from "@/pages/Notices";
 import Papers from "@/pages/Papers";
 import Regulations from "@/pages/Regulations";
 import Admissions from "@/pages/Admissions";
+import Photos from "@/pages/Photos";
 import Admin from "@/pages/Admin";
 import NotFound from "@/pages/not-found";
 
@@ -40,6 +41,8 @@ function Router() {
         <Route path="/regulations" component={Regulations} />
         <Route path="/admissions"><Redirect to="/admissions/guidelines" /></Route>
         <Route path="/admissions/guidelines" component={Admissions} />
+        <Route path="/photos/:id" component={Photos} />
+        <Route path="/photos" component={Photos} />
         <Route path="/talent-pool"><Redirect to="/admissions/guidelines" /></Route>
         <Route path="/privacy"><Redirect to="/" /></Route>
         <Route path="/admin" component={Admin} />

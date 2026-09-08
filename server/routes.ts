@@ -1,11 +1,19 @@
 import type { Express, NextFunction, Request, RequestHandler, Response } from "express";
 import type { Server } from "http";
 import { randomBytes, randomUUID, timingSafeEqual } from "crypto";
+import { ZipArchive, type ArchiverError } from "archiver";
 import fs from "fs";
 import multer from "multer";
 import path from "path";
+import sharp from "sharp";
 import { z } from "zod";
-import { getStorage, type IStorage } from "./storage";
+import {
+  getStorage,
+  type IStorage,
+  type PhotoAlbumWithImages,
+  type PhotoImageMetadata,
+  type StoredPhotoImageInput,
+} from "./storage";
 import {
   auditEvent,
   hashPassword,
@@ -65,12 +73,169 @@ const publicContentMutationLimiter = rateLimit({
   max: 30,
   message: "콘텐츠 변경 요청이 너무 많습니다. 잠시 후 다시 시도해주세요",
 });
+const photoUploadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: "사진 업로드 요청이 너무 많습니다. 잠시 후 다시 시도해주세요",
+});
+const photoDownloadLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 60,
+  message: "사진 다운로드 요청이 너무 많습니다. 잠시 후 다시 시도해주세요",
+});
+const photoInlineImageLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 600,
+  message: "사진 조회 요청이 너무 많습니다. 잠시 후 다시 시도해주세요",
+});
+const photoImageRateLimit: RequestHandler = (req, res, next) => {
+  const limiter = req.query.download === "1" ? photoDownloadLimiter : photoInlineImageLimiter;
+  return limiter(req, res, next);
+};
+
+const MAX_PHOTO_FILES = 12;
+const MAX_PHOTO_INPUT_BYTES = 8 * 1024 * 1024;
+const MAX_OPTIMIZED_PHOTO_BYTES = 3 * 1024 * 1024;
+const MAX_PHOTO_ALBUM_BYTES = 30 * 1024 * 1024;
+const PHOTO_TYPES: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+  ".webp": "image/webp",
+};
+
+const photoUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: MAX_PHOTO_INPUT_BYTES,
+    files: MAX_PHOTO_FILES,
+    fields: 4,
+    fieldSize: 64 * 1024,
+    // Busboy raises LIMIT_PART_COUNT when the configured count is reached,
+    // so allow one sentinel part beyond the four metadata fields + 12 files.
+    parts: MAX_PHOTO_FILES + 5,
+  },
+  fileFilter: (_req, file, callback) => {
+    const extension = path.extname(file.originalname).toLowerCase();
+    if (PHOTO_TYPES[extension] !== file.mimetype) {
+      callback(new Error("PHOTO_UPLOAD_REJECTED"));
+      return;
+    }
+    callback(null, true);
+  },
+});
+
+const photoUploadMiddleware: RequestHandler = (req, res, next) => {
+  photoUpload.array("images", MAX_PHOTO_FILES)(req, res, error => {
+    if (error instanceof multer.MulterError) {
+      const message = error.code === "LIMIT_FILE_SIZE"
+        ? "사진 한 장의 최대 크기는 8MB입니다"
+        : error.code === "LIMIT_FILE_COUNT"
+          ? "한 번에 최대 12장의 사진을 등록할 수 있습니다"
+          : "사진 업로드 제한을 확인해주세요";
+      return res.status(400).json({ error: message, code: "PHOTO_UPLOAD_REJECTED" });
+    }
+    if (error) {
+      return res.status(400).json({
+        error: "JPEG, PNG 또는 WebP 사진만 등록할 수 있습니다",
+        code: "PHOTO_UPLOAD_REJECTED",
+      });
+    }
+    next();
+  });
+};
+
+type PhotoWorkLease = {
+  workStarted: boolean;
+  release: () => void;
+};
+
+const PHOTO_UPLOAD_LEASE_KEY = "photoUploadConcurrencyLease";
+const PHOTO_ARCHIVE_LEASE_KEY = "photoArchiveConcurrencyLease";
+
+function createPhotoWorkConcurrencyGuard(options: {
+  maxConcurrent: number;
+  leaseKey: string;
+  auditAction: string;
+  error: string;
+  code: string;
+}): RequestHandler {
+  let activeWork = 0;
+  return (req, res, next) => {
+    if (activeWork >= options.maxConcurrent) {
+      auditEvent(req, options.auditAction);
+      res.setHeader("Cache-Control", "no-store, max-age=0");
+      res.setHeader("Retry-After", "1");
+      return res.status(429).json({
+        error: options.error,
+        code: options.code,
+      });
+    }
+
+    activeWork += 1;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      activeWork = Math.max(0, activeWork - 1);
+    };
+    const lease: PhotoWorkLease = { workStarted: false, release };
+    res.locals[options.leaseKey] = lease;
+    const releaseBeforeWork = () => {
+      if (!lease.workStarted) release();
+    };
+    req.once("aborted", releaseBeforeWork);
+    res.once("finish", releaseBeforeWork);
+    res.once("close", releaseBeforeWork);
+    res.once("error", releaseBeforeWork);
+    next();
+  };
+}
+
+function beginPhotoWork(res: Response, leaseKey: string): () => void {
+  const lease = res.locals[leaseKey] as PhotoWorkLease | undefined;
+  if (!lease) {
+    throw new Error(`Missing photo work lease: ${leaseKey}`);
+  }
+  lease.workStarted = true;
+  return lease.release;
+}
+
+export function createPhotoUploadConcurrencyGuard(maxConcurrentUploads = 1): RequestHandler {
+  return createPhotoWorkConcurrencyGuard({
+    maxConcurrent: maxConcurrentUploads,
+    leaseKey: PHOTO_UPLOAD_LEASE_KEY,
+    auditAction: "photo_upload.concurrent_rejected",
+    error: "다른 사진을 처리 중입니다. 잠시 후 다시 시도해주세요",
+    code: "PHOTO_UPLOAD_BUSY",
+  });
+}
+
+export function beginPhotoUploadWork(res: Response): () => void {
+  return beginPhotoWork(res, PHOTO_UPLOAD_LEASE_KEY);
+}
+
+const photoUploadConcurrency = createPhotoUploadConcurrencyGuard();
+const photoArchiveConcurrency = createPhotoWorkConcurrencyGuard({
+  maxConcurrent: 2,
+  leaseKey: PHOTO_ARCHIVE_LEASE_KEY,
+  auditAction: "photo_archive.concurrent_rejected",
+  error: "다른 사진 묶음을 생성 중입니다. 잠시 후 다시 시도해주세요",
+  code: "PHOTO_ARCHIVE_BUSY",
+});
 
 const usernameSchema = z.string().trim().min(4).max(32).regex(/^[A-Za-z0-9._-]+$/);
 const passwordSchema = z.string().min(10).max(128);
 const nameSchema = z.string().trim().min(1).max(80);
 const dateSchema = z.string().trim().regex(/^\d{4}[.-]\d{2}[.-]\d{2}$/);
 const isoDateSchema = z.string().trim().regex(/^\d{4}-\d{2}-\d{2}$/);
+const photoDateSchema = isoDateSchema.refine(value => {
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day));
+  return date.getUTCFullYear() === year
+    && date.getUTCMonth() === month - 1
+    && date.getUTCDate() === day;
+}, "유효한 날짜를 입력해주세요");
 const fileReferenceSchema = z.string().trim().max(300).refine(value => {
   if (!value.startsWith("/uploads/")) return false;
   const filename = value.slice("/uploads/".length);
@@ -146,6 +311,18 @@ const admissionGuidelineUpdateSchema = admissionGuidelineCreateSchema
   .partial()
   .refine(value => Object.keys(value).length > 0);
 const commentSchema = z.object({ content: z.string().trim().min(1).max(2_000) });
+const photoAlbumCreateSchema = z.object({
+  title: z.string().trim().min(1).max(200),
+  content: z.string().trim().max(20_000),
+  organization: z.string().trim().min(1).max(120),
+  date: photoDateSchema,
+}).strict();
+const photoAlbumUpdateSchema = photoAlbumCreateSchema
+  .partial()
+  .refine(value => Object.keys(value).length > 0);
+const photoImageOrderSchema = z.object({
+  imageIds: z.array(z.number().int().positive()).min(1).max(500),
+}).strict();
 
 const retiredPaperCommentWrite: RequestHandler = (_req, res) => res.status(410).json({
   error: "논문 댓글 기능은 종료되었습니다",
@@ -222,6 +399,158 @@ function publicSessionUser(user: {
   authVersion: number;
 }) {
   return { id: user.id, username: user.username, name: user.name, role: user.role };
+}
+
+function publicPhotoImage(image: PhotoImageMetadata) {
+  return {
+    id: image.id,
+    albumId: image.albumId,
+    fileName: image.fileName,
+    mimeType: image.mimeType,
+    byteSize: image.byteSize,
+    width: image.width,
+    height: image.height,
+    sortOrder: image.sortOrder,
+    altText: image.altText,
+    url: `/api/photo-images/${image.id}`,
+    downloadUrl: `/api/photo-images/${image.id}?download=1`,
+  };
+}
+
+function publicPhotoAlbum(record: PhotoAlbumWithImages, includeImages: boolean) {
+  const { album, images } = record;
+  const summary = {
+    id: album.id,
+    title: album.title,
+    content: album.content,
+    organization: album.organization,
+    date: album.date,
+    views: album.views,
+    imageCount: images.length,
+    coverImage: images[0] ? publicPhotoImage(images[0]) : null,
+    downloadUrl: `/api/photos/${album.id}/download`,
+  };
+  return includeImages
+    ? { ...summary, images: images.map(publicPhotoImage) }
+    : summary;
+}
+
+function hasValidPhotoMagic(file: Express.Multer.File): boolean {
+  const bytes = file.buffer;
+  const extension = path.extname(file.originalname).toLowerCase();
+  const jpeg = bytes.length >= 3
+    && bytes[0] === 0xff
+    && bytes[1] === 0xd8
+    && bytes[2] === 0xff;
+  const png = bytes.length >= 8
+    && bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  const webp = bytes.length >= 12
+    && bytes.subarray(0, 4).toString("ascii") === "RIFF"
+    && bytes.subarray(8, 12).toString("ascii") === "WEBP";
+
+  if ([".jpg", ".jpeg"].includes(extension)) return file.mimetype === "image/jpeg" && jpeg;
+  if (extension === ".png") return file.mimetype === "image/png" && png;
+  if (extension === ".webp") return file.mimetype === "image/webp" && webp;
+  return false;
+}
+
+function safePhotoFileName(originalName: string, fallbackIndex: number): string {
+  const extension = path.extname(originalName);
+  const rawStem = path.basename(originalName, extension).normalize("NFKC");
+  const sanitizedStem = rawStem
+    .replace(/[\u0000-\u001f\u007f/\\<>:"|?*]+/g, "-")
+    .replace(/\s+/g, " ")
+    .replace(/^\.+|\.+$/g, "")
+    .trim()
+    .slice(0, 100);
+  return `${sanitizedStem || `photo-${fallbackIndex + 1}`}.webp`;
+}
+
+class PhotoProcessingError extends Error {
+  constructor(
+    readonly code: "PHOTO_CONTENT_INVALID" | "PHOTO_OPTIMIZED_TOO_LARGE",
+    message: string,
+  ) {
+    super(message);
+    this.name = "PhotoProcessingError";
+  }
+}
+
+async function processPhotoFiles(
+  files: Express.Multer.File[],
+): Promise<StoredPhotoImageInput[]> {
+  const optimized: StoredPhotoImageInput[] = [];
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
+    if (!hasValidPhotoMagic(file)) {
+      throw new PhotoProcessingError("PHOTO_CONTENT_INVALID", "사진 파일의 형식과 내용을 확인해주세요");
+    }
+    try {
+      const result = await sharp(file.buffer, {
+        failOn: "error",
+        limitInputPixels: 40_000_000,
+        sequentialRead: true,
+      })
+        .rotate()
+        .resize({
+          width: 2000,
+          height: 1500,
+          fit: "inside",
+          withoutEnlargement: true,
+        })
+        // Sharp omits EXIF/XMP/IPTC metadata unless keepMetadata/withMetadata is requested.
+        .webp({ quality: 82, effort: 4 })
+        .toBuffer({ resolveWithObject: true });
+
+      if (result.data.length > MAX_OPTIMIZED_PHOTO_BYTES) {
+        throw new PhotoProcessingError(
+          "PHOTO_OPTIMIZED_TOO_LARGE",
+          "최적화된 사진 한 장의 크기는 3MB를 초과할 수 없습니다",
+        );
+      }
+      if (!result.info.width || !result.info.height) {
+        throw new PhotoProcessingError("PHOTO_CONTENT_INVALID", "사진 크기를 확인할 수 없습니다");
+      }
+      optimized.push({
+        fileName: safePhotoFileName(file.originalname, index),
+        mimeType: "image/webp",
+        byteSize: result.data.length,
+        width: result.info.width,
+        height: result.info.height,
+        data: result.data,
+      });
+    } catch (error) {
+      if (error instanceof PhotoProcessingError) throw error;
+      throw new PhotoProcessingError("PHOTO_CONTENT_INVALID", "손상되었거나 처리할 수 없는 사진입니다");
+    }
+  }
+  return optimized;
+}
+
+function photoFiles(req: Request, res: Response): Express.Multer.File[] | null {
+  const files = req.files as Express.Multer.File[] | undefined;
+  if (!files?.length) {
+    res.status(400).json({ error: "사진을 한 장 이상 선택해주세요", code: "PHOTO_REQUIRED" });
+    return null;
+  }
+  return files;
+}
+
+function sendPhotoProcessingError(res: Response, error: unknown): boolean {
+  if (!(error instanceof PhotoProcessingError)) return false;
+  res.status(400).json({ error: error.message, code: error.code });
+  return true;
+}
+
+function safeArchiveName(title: string): string {
+  const name = title
+    .normalize("NFKC")
+    .replace(/[\u0000-\u001f\u007f/\\<>:"|?*]+/g, "-")
+    .replace(/\s+/g, " ")
+    .replace(/^\.+|\.+$/g, "")
+    .trim()
+    .slice(0, 80);
+  return `${name || "photo-album"}.zip`;
 }
 
 function isMagicNumberValid(file: Express.Multer.File): boolean {
@@ -684,6 +1013,254 @@ export async function registerRoutes(httpServer: Server, app: Express, storageOv
       return res.status(404).json({ error: "모집요강을 찾을 수 없습니다", code: "ADMISSION_NOT_FOUND" });
     }
     return res.json({ success: true, views });
+  }));
+
+  app.get("/api/photos", asyncHandler(async (_req, res) => {
+    const albums = await storage.getPhotoAlbums();
+    res.setHeader("Cache-Control", "no-cache, max-age=0, must-revalidate");
+    return res.json(albums.map(album => publicPhotoAlbum(album, false)));
+  }));
+
+  app.get("/api/photos/:id/download", photoDownloadLimiter, photoArchiveConcurrency, asyncHandler(async (req, res) => {
+    const releaseArchive = beginPhotoWork(res, PHOTO_ARCHIVE_LEASE_KEY);
+    try {
+      const id = parseId(req, res);
+      if (!id) return;
+      const album = await storage.getPhotoAlbum(id);
+      if (res.destroyed) return;
+      if (!album) {
+        return res.status(404).json({ error: "사진자료를 찾을 수 없습니다", code: "PHOTO_ALBUM_NOT_FOUND" });
+      }
+      const images = await storage.getPhotoAlbumImages(id);
+      if (res.destroyed) return;
+      if (!images.length) {
+        return res.status(409).json({ error: "다운로드할 사진이 없습니다", code: "PHOTO_ALBUM_EMPTY" });
+      }
+
+      res.setHeader("Cache-Control", "private, no-store, max-age=0");
+      res.setHeader("X-Content-Type-Options", "nosniff");
+      res.attachment(safeArchiveName(album.album.title));
+      res.type("application/zip");
+
+      const archive = new ZipArchive({ store: true });
+      const responseDone = new Promise<void>(resolve => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          resolve();
+        };
+        res.once("finish", finish);
+        res.once("close", () => {
+          archive.abort();
+          finish();
+        });
+        res.once("error", () => {
+          archive.abort();
+          finish();
+        });
+      });
+      archive.on("warning", (error: ArchiverError) => {
+        console.warn(JSON.stringify({
+          type: "photo_archive_warning",
+          requestId: req.requestId,
+          error: error.code ?? error.name,
+        }));
+      });
+      archive.on("error", (error: ArchiverError) => {
+        console.error(JSON.stringify({
+          type: "photo_archive_error",
+          requestId: req.requestId,
+          error: error.name,
+        }));
+        if (!res.destroyed) res.destroy(error);
+      });
+      archive.pipe(res);
+      images.forEach((image, index) => {
+        const position = String(index + 1).padStart(2, "0");
+        archive.append(image.data, { name: `${position}_${image.fileName}` });
+      });
+      auditEvent(req, "photo.download", `photo_album:${id}`);
+      const finalizeDone = archive.finalize().catch(error => {
+        if (!res.destroyed) res.destroy(error as Error);
+      });
+      await Promise.race([finalizeDone, responseDone]);
+      if (!res.destroyed) {
+        await finalizeDone;
+        await responseDone;
+      }
+    } finally {
+      releaseArchive();
+    }
+  }));
+
+  app.get("/api/photos/:id", asyncHandler(async (req, res) => {
+    const id = parseId(req, res);
+    if (!id) return;
+    const album = await storage.getPhotoAlbum(id);
+    if (!album) {
+      return res.status(404).json({ error: "사진자료를 찾을 수 없습니다", code: "PHOTO_ALBUM_NOT_FOUND" });
+    }
+    res.setHeader("Cache-Control", "no-cache, max-age=0, must-revalidate");
+    return res.json(publicPhotoAlbum(album, true));
+  }));
+
+  app.patch("/api/photos/:id/views", viewLimiter, asyncHandler(async (req, res) => {
+    const id = parseId(req, res);
+    if (!id) return;
+    const views = await storage.incrementPhotoAlbumViews(id);
+    if (views === undefined) {
+      return res.status(404).json({ error: "사진자료를 찾을 수 없습니다", code: "PHOTO_ALBUM_NOT_FOUND" });
+    }
+    auditEvent(req, "photo.view", `photo_album:${id}`);
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    return res.json({ success: true, views });
+  }));
+
+  app.get("/api/photo-images/:id", photoImageRateLimit, asyncHandler(async (req, res) => {
+    const id = parseId(req, res);
+    if (!id) return;
+    const image = await storage.getPhotoImage(id);
+    if (!image) {
+      return res.status(404).json({ error: "사진을 찾을 수 없습니다", code: "PHOTO_IMAGE_NOT_FOUND" });
+    }
+
+    const download = req.query.download === "1";
+    const etag = `"photo-${image.id}-${image.byteSize}"`;
+    res.setHeader("ETag", etag);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    if (download) {
+      res.setHeader("Cache-Control", "private, no-store, max-age=0");
+      res.attachment(image.fileName);
+      auditEvent(req, "photo_image.download", `photo_image:${id}`);
+    } else {
+      res.setHeader("Cache-Control", "public, no-cache, max-age=0, must-revalidate");
+      if (req.get("If-None-Match") === etag) return res.status(304).end();
+    }
+    res.setHeader("Content-Length", String(image.byteSize));
+    res.type(image.mimeType);
+    return res.send(image.data);
+  }));
+
+  app.post("/api/photos", adminOnly, photoUploadConcurrency, photoUploadLimiter, photoUploadMiddleware, asyncHandler(async (req, res) => {
+    const releaseUpload = beginPhotoUploadWork(res);
+    try {
+      const input = parseBody(photoAlbumCreateSchema, req, res);
+      const files = photoFiles(req, res);
+      if (!input || !files) return;
+      const images = await processPhotoFiles(files);
+      const totalBytes = images.reduce((sum, image) => sum + image.byteSize, 0);
+      if (totalBytes > MAX_PHOTO_ALBUM_BYTES) {
+        return res.status(400).json({
+          error: "사진자료 한 건의 최적화 후 전체 크기는 30MB를 초과할 수 없습니다",
+          code: "PHOTO_ALBUM_TOO_LARGE",
+        });
+      }
+      const album = await storage.createPhotoAlbum(input, images);
+      auditEvent(req, "photo.create", `photo_album:${album.album.id};images:${images.length}`);
+      res.setHeader("Cache-Control", "no-store, max-age=0");
+      return res.status(201).json(publicPhotoAlbum(album, true));
+    } catch (error) {
+      if (sendPhotoProcessingError(res, error)) return;
+      throw error;
+    } finally {
+      releaseUpload();
+    }
+  }));
+
+  app.patch("/api/photos/:id", adminOnly, publicContentMutationLimiter, asyncHandler(async (req, res) => {
+    const id = parseId(req, res);
+    const input = parseBody(photoAlbumUpdateSchema, req, res);
+    if (!id || !input) return;
+    const album = await storage.updatePhotoAlbum(id, input);
+    if (!album) {
+      return res.status(404).json({ error: "사진자료를 찾을 수 없습니다", code: "PHOTO_ALBUM_NOT_FOUND" });
+    }
+    auditEvent(req, "photo.update", `photo_album:${id}`);
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    return res.json(publicPhotoAlbum(album, true));
+  }));
+
+  app.post("/api/photos/:id/images", adminOnly, photoUploadConcurrency, photoUploadLimiter, photoUploadMiddleware, asyncHandler(async (req, res) => {
+    const releaseUpload = beginPhotoUploadWork(res);
+    try {
+      const id = parseId(req, res);
+      const files = photoFiles(req, res);
+      if (!id || !files) return;
+      const images = await processPhotoFiles(files);
+      const result = await storage.addPhotoImages(id, images, MAX_PHOTO_ALBUM_BYTES, MAX_PHOTO_FILES);
+      if (result.status === "not_found") {
+        return res.status(404).json({ error: "사진자료를 찾을 수 없습니다", code: "PHOTO_ALBUM_NOT_FOUND" });
+      }
+      if (result.status === "album_too_large") {
+        return res.status(400).json({
+          error: "사진자료 한 건의 최적화 후 전체 크기는 30MB를 초과할 수 없습니다",
+          code: "PHOTO_ALBUM_TOO_LARGE",
+        });
+      }
+      if (result.status === "album_full") {
+        return res.status(400).json({
+          error: "사진자료 한 건에는 최대 12장의 사진을 등록할 수 있습니다",
+          code: "PHOTO_ALBUM_FULL",
+        });
+      }
+      auditEvent(req, "photo_images.create", `photo_album:${id};images:${images.length}`);
+      res.setHeader("Cache-Control", "no-store, max-age=0");
+      return res.status(201).json(publicPhotoAlbum(result.album, true));
+    } catch (error) {
+      if (sendPhotoProcessingError(res, error)) return;
+      throw error;
+    } finally {
+      releaseUpload();
+    }
+  }));
+
+  app.patch("/api/photos/:id/images/order", adminOnly, publicContentMutationLimiter, asyncHandler(async (req, res) => {
+    const id = parseId(req, res);
+    const input = parseBody(photoImageOrderSchema, req, res);
+    if (!id || !input) return;
+    const result = await storage.reorderPhotoImages(id, input.imageIds);
+    if (result.status === "not_found") {
+      return res.status(404).json({ error: "사진자료를 찾을 수 없습니다", code: "PHOTO_ALBUM_NOT_FOUND" });
+    }
+    if (result.status === "invalid_order") {
+      return res.status(400).json({
+        error: "현재 사진의 식별자를 중복 없이 모두 포함해야 합니다",
+        code: "PHOTO_IMAGE_ORDER_INVALID",
+      });
+    }
+    auditEvent(req, "photo_images.reorder", `photo_album:${id}`);
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    return res.json(publicPhotoAlbum(result.album, true));
+  }));
+
+  app.delete("/api/photo-images/:id", adminOnly, publicContentMutationLimiter, asyncHandler(async (req, res) => {
+    const id = parseId(req, res);
+    if (!id) return;
+    const result = await storage.deletePhotoImageSafely(id);
+    if (result === "not_found") {
+      return res.status(404).json({ error: "사진을 찾을 수 없습니다", code: "PHOTO_IMAGE_NOT_FOUND" });
+    }
+    if (result === "last_image") {
+      return res.status(409).json({
+        error: "사진자료에는 최소 한 장의 사진이 있어야 합니다. 전체 게시물을 삭제해주세요",
+        code: "LAST_PHOTO_IMAGE_BLOCKED",
+      });
+    }
+    auditEvent(req, "photo_image.delete", `photo_image:${id}`);
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    return res.json({ success: true });
+  }));
+
+  app.delete("/api/photos/:id", adminOnly, publicContentMutationLimiter, asyncHandler(async (req, res) => {
+    const id = parseId(req, res);
+    if (!id) return;
+    if (!await storage.deletePhotoAlbum(id)) {
+      return res.status(404).json({ error: "사진자료를 찾을 수 없습니다", code: "PHOTO_ALBUM_NOT_FOUND" });
+    }
+    auditEvent(req, "photo.delete", `photo_album:${id}`);
+    res.setHeader("Cache-Control", "no-store, max-age=0");
+    return res.json({ success: true });
   }));
 
   app.get("/api/notices", asyncHandler(async (req, res) => {

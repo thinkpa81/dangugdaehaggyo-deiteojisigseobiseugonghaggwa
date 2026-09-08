@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { pgTable, text, varchar, serial, integer, boolean, timestamp } from "drizzle-orm/pg-core";
+import { pgTable, text, varchar, serial, integer, boolean, timestamp, customType, index } from "drizzle-orm/pg-core";
 import { createInsertSchema } from "drizzle-zod";
 import { z } from "zod";
 import { relations } from "drizzle-orm";
@@ -45,6 +45,61 @@ export const admissionGuidelines = pgTable("admission_guidelines", {
 export const insertAdmissionGuidelineSchema = createInsertSchema(admissionGuidelines).omit({ id: true });
 export type InsertAdmissionGuideline = z.infer<typeof insertAdmissionGuidelineSchema>;
 export type AdmissionGuideline = typeof admissionGuidelines.$inferSelect;
+
+const bytea = customType<{ data: Buffer; driverData: Buffer }>({
+  dataType() {
+    return "bytea";
+  },
+});
+
+export const photoAlbums = pgTable("photo_albums", {
+  id: serial("id").primaryKey(),
+  title: text("title").notNull(),
+  content: text("content").notNull(),
+  organization: text("organization").notNull(),
+  date: text("date").notNull(),
+  views: integer("views").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("idx_photo_albums_date").on(table.date, table.id),
+]);
+
+export const photoImages = pgTable("photo_images", {
+  id: serial("id").primaryKey(),
+  albumId: integer("album_id")
+    .notNull()
+    .references(() => photoAlbums.id, { onDelete: "cascade" }),
+  fileName: text("file_name").notNull(),
+  mimeType: text("mime_type").notNull(),
+  byteSize: integer("byte_size").notNull(),
+  width: integer("width").notNull(),
+  height: integer("height").notNull(),
+  sortOrder: integer("sort_order").notNull(),
+  altText: text("alt_text").notNull(),
+  data: bytea("image_data").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  index("idx_photo_images_album_order").on(table.albumId, table.sortOrder, table.id),
+]);
+
+export const photoAlbumsRelations = relations(photoAlbums, ({ many }) => ({
+  images: many(photoImages),
+}));
+
+export const photoImagesRelations = relations(photoImages, ({ one }) => ({
+  album: one(photoAlbums, { fields: [photoImages.albumId], references: [photoAlbums.id] }),
+}));
+
+export const insertPhotoAlbumSchema = createInsertSchema(photoAlbums).omit({
+  id: true,
+  views: true,
+  createdAt: true,
+  updatedAt: true,
+});
+export type InsertPhotoAlbum = z.infer<typeof insertPhotoAlbumSchema>;
+export type PhotoAlbum = typeof photoAlbums.$inferSelect;
+export type PhotoImage = typeof photoImages.$inferSelect;
 
 export const notices = pgTable("notices", {
   id: serial("id").primaryKey(),

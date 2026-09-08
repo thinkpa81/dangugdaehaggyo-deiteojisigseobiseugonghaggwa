@@ -1,10 +1,16 @@
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import express from "express";
 import session from "express-session";
-import { registerRoutes } from "../server/routes";
+import sharp from "sharp";
+import {
+  beginPhotoUploadWork,
+  createPhotoUploadConcurrencyGuard,
+  registerRoutes,
+} from "../server/routes";
 import {
   hashPassword,
   isPasswordHash,
@@ -23,7 +29,7 @@ function mockRequest(overrides: Record<string, unknown> = {}) {
   const headers = new Map<string, string>();
   const providedHeaders = overrides.headers as Record<string, string> | undefined;
   Object.entries(providedHeaders ?? {}).forEach(([name, value]) => headers.set(name.toLowerCase(), value));
-  return {
+  return Object.assign(new EventEmitter(), {
     method: "POST",
     protocol: "https",
     ip: "127.0.0.1",
@@ -31,7 +37,7 @@ function mockRequest(overrides: Record<string, unknown> = {}) {
     session: {},
     get(name: string) { return headers.get(name.toLowerCase()); },
     ...overrides,
-  } as any;
+  }) as any;
 }
 
 function mockResponse() {
@@ -39,10 +45,17 @@ function mockResponse() {
     statusCode: 200,
     body: undefined as unknown,
     headers: {} as Record<string, string>,
+    locals: {} as Record<string, unknown>,
     status(code: number) { this.statusCode = code; return this; },
     json(body: unknown) { this.body = body; return this; },
     setHeader(name: string, value: string) { this.headers[name] = String(value); },
   } as any;
+}
+
+function mockEventResponse() {
+  const response = new EventEmitter() as EventEmitter & ReturnType<typeof mockResponse>;
+  Object.assign(response, mockResponse());
+  return response;
 }
 
 const testPassword = () => randomBytes(24).toString("base64url");
@@ -50,9 +63,43 @@ const password = testPassword();
 const wrongPassword = testPassword();
 const hash = await hashPassword(password);
 
+const uploadConcurrencyGuard = createPhotoUploadConcurrencyGuard(1);
+const firstUploadResponse = mockEventResponse();
+let firstUploadStarted = false;
+uploadConcurrencyGuard(mockRequest(), firstUploadResponse, () => { firstUploadStarted = true; });
+assert.equal(firstUploadStarted, true);
+const releaseFirstUpload = beginPhotoUploadWork(firstUploadResponse as any);
+firstUploadResponse.emit("close");
+const blockedUploadResponse = mockEventResponse();
+uploadConcurrencyGuard(mockRequest(), blockedUploadResponse, () => assert.fail("Concurrent upload must not start"));
+assert.equal(blockedUploadResponse.statusCode, 429);
+assert.equal((blockedUploadResponse.body as { code: string }).code, "PHOTO_UPLOAD_BUSY");
+releaseFirstUpload();
+const uploadAfterFinishResponse = mockEventResponse();
+let uploadAfterFinishStarted = false;
+uploadConcurrencyGuard(mockRequest(), uploadAfterFinishResponse, () => { uploadAfterFinishStarted = true; });
+assert.equal(uploadAfterFinishStarted, true);
+uploadAfterFinishResponse.emit("finish");
+uploadAfterFinishResponse.emit("close");
+const uploadAfterCloseResponse = mockEventResponse();
+let uploadAfterCloseStarted = false;
+uploadConcurrencyGuard(mockRequest(), uploadAfterCloseResponse, () => { uploadAfterCloseStarted = true; });
+assert.equal(uploadAfterCloseStarted, true);
+uploadAfterCloseResponse.emit("close");
+const uploadAfterErrorResponse = mockEventResponse();
+let uploadAfterErrorStarted = false;
+uploadConcurrencyGuard(mockRequest(), uploadAfterErrorResponse, () => { uploadAfterErrorStarted = true; });
+assert.equal(uploadAfterErrorStarted, true);
+uploadAfterErrorResponse.emit("error", new Error("simulated response error"));
+
 const routesSource = await readFile(new URL("../server/routes.ts", import.meta.url), "utf8");
+const storageSource = await readFile(new URL("../server/storage.ts", import.meta.url), "utf8");
 const publicRoutes = [
   ["get", "/uploads/:filename", "downloadLimiter, asyncHandler"],
+  ["get", "/api/photos", "asyncHandler"],
+  ["get", "/api/photos/:id", "asyncHandler"],
+  ["get", "/api/photos/:id/download", "photoDownloadLimiter"],
+  ["get", "/api/photo-images/:id", "photoImageRateLimit"],
 ] as const;
 const routeSourceLines = routesSource.split(/\r?\n/);
 for (const [method, route, middleware] of publicRoutes) {
@@ -74,6 +121,12 @@ for (const [method, route, limiter] of [
   ["patch", "/api/papers/:id", "publicContentMutationLimiter"],
   ["delete", "/api/papers/:id", "publicContentMutationLimiter"],
   ["post", "/api/upload", "uploadLimiter"],
+  ["post", "/api/photos", "photoUploadLimiter"],
+  ["patch", "/api/photos/:id", "publicContentMutationLimiter"],
+  ["post", "/api/photos/:id/images", "photoUploadLimiter"],
+  ["patch", "/api/photos/:id/images/order", "publicContentMutationLimiter"],
+  ["delete", "/api/photo-images/:id", "publicContentMutationLimiter"],
+  ["delete", "/api/photos/:id", "publicContentMutationLimiter"],
 ] as const) {
   const declaration = routeSourceLines.find(line => line.includes(`app.${method}("${route}"`));
   assert.ok(
@@ -89,6 +142,41 @@ for (const [method, route, limiter] of [
     `${method.toUpperCase()} ${route} must authenticate before applying the mutation limiter`,
   );
 }
+const photoViewDeclaration = routeSourceLines.find(line => line.includes('app.patch("/api/photos/:id/views"'));
+assert.ok(photoViewDeclaration?.includes("viewLimiter"), "Photo view writes must remain rate-limited");
+assert.equal(photoViewDeclaration?.includes("adminOnly"), false, "Photo view counting must remain public");
+const photoArchiveDeclaration = routeSourceLines.find(line => line.includes('app.get("/api/photos/:id/download"'));
+assert.ok(photoArchiveDeclaration?.includes("photoArchiveConcurrency"), "Photo ZIP downloads must be concurrency-limited");
+assert.ok(
+  (photoArchiveDeclaration?.indexOf("photoArchiveConcurrency") ?? -1)
+    < (photoArchiveDeclaration?.indexOf("asyncHandler") ?? -1),
+  "Photo ZIP concurrency must be acquired before loading image bytes",
+);
+assert.ok(routesSource.includes("hasValidPhotoMagic(file)"), "Photo content must be checked by magic number");
+for (const route of ['app.post("/api/photos"', 'app.post("/api/photos/:id/images"']) {
+  const declaration = routeSourceLines.find(line => line.includes(route));
+  assert.ok(declaration?.includes("photoUploadConcurrency"), `${route} must limit upload concurrency`);
+  assert.ok(
+    (declaration?.indexOf("adminOnly") ?? -1) < (declaration?.indexOf("photoUploadConcurrency") ?? -1),
+    `${route} must authenticate before acquiring an upload slot`,
+  );
+  assert.ok(
+    (declaration?.indexOf("photoUploadConcurrency") ?? -1) < (declaration?.indexOf("photoUploadLimiter") ?? -1),
+    `${route} busy retries must not consume the upload rate limit`,
+  );
+  assert.ok(
+    (declaration?.indexOf("photoUploadConcurrency") ?? -1) < (declaration?.indexOf("photoUploadMiddleware") ?? -1),
+    `${route} must acquire an upload slot before buffering multipart files`,
+  );
+}
+assert.ok(routesSource.includes("limitInputPixels: 40_000_000"), "Photo decoding must limit input pixels");
+assert.ok(routesSource.includes(".webp({ quality: 82"), "Photos must be normalized to optimized WebP");
+assert.ok(routesSource.includes("fieldSize: 64 * 1024"), "Korean 20k-character content must fit multipart parsing");
+assert.equal(
+  (storageSource.match(/existing\.length \+ images\.length > maxAlbumImages/g) ?? []).length,
+  2,
+  "Memory and database storage must both enforce the album image cap",
+);
 for (const [method, route] of [
   ["post", "/api/papers/:id/comments"],
   ["patch", "/api/paper-comments/:id"],
@@ -306,6 +394,63 @@ assert.equal((await storage.updatePaper(paper.id, { title: "Updated operations p
 await storage.deletePaper(paper.id);
 assert.equal(await storage.getPaper(paper.id), undefined);
 
+const memoryPhotoImage = (name: string, size = 4) => ({
+  fileName: name,
+  mimeType: "image/webp",
+  byteSize: size,
+  width: 2,
+  height: 2,
+  data: Buffer.alloc(size, 1),
+});
+const photoAlbum = await storage.createPhotoAlbum({
+  title: "Security photo album",
+  content: "Memory-only photo gallery fixture",
+  organization: "Dankook Graduate School",
+  date: "2026-09-08",
+}, [memoryPhotoImage("first.webp"), memoryPhotoImage("second.webp")]);
+assert.equal(photoAlbum.images.length, 2);
+assert.equal("data" in photoAlbum.images[0], false);
+assert.equal(photoAlbum.images[0].altText, "Security photo album 사진 1");
+assert.equal(await storage.incrementPhotoAlbumViews(photoAlbum.album.id), 1);
+assert.equal((await storage.getPhotoAlbum(photoAlbum.album.id))?.album.views, 1);
+const fullPhotoImage = await storage.getPhotoImage(photoAlbum.images[0].id);
+assert.deepEqual(fullPhotoImage?.data, Buffer.alloc(4, 1));
+
+const reversedPhotoIds = [...photoAlbum.images].reverse().map(image => image.id);
+const reorderedPhotoAlbum = await storage.reorderPhotoImages(photoAlbum.album.id, reversedPhotoIds);
+assert.equal(reorderedPhotoAlbum.status, "updated");
+if (reorderedPhotoAlbum.status === "updated") {
+  assert.deepEqual(reorderedPhotoAlbum.album.images.map(image => image.id), reversedPhotoIds);
+  assert.equal(reorderedPhotoAlbum.album.images[0].altText, "Security photo album 사진 1");
+}
+assert.equal(
+  (await storage.reorderPhotoImages(photoAlbum.album.id, [reversedPhotoIds[0]])).status,
+  "invalid_order",
+);
+assert.equal(
+  (await storage.addPhotoImages(
+    photoAlbum.album.id,
+    Array.from({ length: 11 }, (_, index) => memoryPhotoImage(`extra-${index}.webp`)),
+    30 * 1024 * 1024,
+    12,
+  )).status,
+  "album_full",
+);
+assert.equal((await storage.getPhotoAlbum(photoAlbum.album.id))?.images.length, 2);
+assert.equal(
+  (await storage.addPhotoImages(
+    photoAlbum.album.id,
+    [{ ...memoryPhotoImage("too-large.webp"), byteSize: 30 * 1024 * 1024 }],
+    30 * 1024 * 1024,
+    12,
+  )).status,
+  "album_too_large",
+);
+assert.equal(await storage.deletePhotoImageSafely(reversedPhotoIds[0]), "deleted");
+assert.equal(await storage.deletePhotoImageSafely(reversedPhotoIds[1]), "last_image");
+assert.equal(await storage.deletePhotoAlbum(photoAlbum.album.id), true);
+assert.equal(await storage.getPhotoImage(reversedPhotoIds[1]), undefined);
+
 const integrationStorage = new MemoryStorage();
 const integrationAdminPassword = testPassword();
 const integrationAdmin = await integrationStorage.createAdmin({
@@ -356,6 +501,8 @@ const originalConsoleInfo = console.info;
 let integrationAdmissionId: number | null = null;
 let integrationNoticeId: number | null = null;
 let integrationPaperId: number | null = null;
+let integrationPhotoAlbumId: number | null = null;
+let integrationFullPhotoAlbumId: number | null = null;
 
 process.env.NODE_ENV = "production";
 console.info = () => {};
@@ -391,6 +538,45 @@ try {
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
+  }
+
+  async function requestForm(route: string, formData: FormData, origin = baseUrl, cookie?: string) {
+    return await fetch(`${baseUrl}${route}`, {
+      method: "POST",
+      headers: {
+        Origin: origin,
+        "Sec-Fetch-Site": origin === baseUrl ? "same-origin" : "cross-site",
+        ...(cookie ? { Cookie: cookie } : {}),
+      },
+      body: formData,
+    });
+  }
+
+  const photoPng = await sharp({
+    create: {
+      width: 12,
+      height: 8,
+      channels: 3,
+      background: { r: 15, g: 74, b: 130 },
+    },
+  }).png().toBuffer();
+  function photoForm(title = "Administrator photo integration test", imageCount = 1) {
+    const form = new FormData();
+    form.append("title", title);
+    form.append("content", "Memory-only photo gallery content");
+    form.append("organization", "Dankook Graduate School");
+    form.append("date", "2026-09-08");
+    for (let index = 0; index < imageCount; index += 1) {
+      form.append("images", new Blob([photoPng], { type: "image/png" }), `fixture-${index + 1}.png`);
+    }
+    return form;
+  }
+  function photoImagesForm(count: number) {
+    const form = new FormData();
+    for (let index = 0; index < count; index += 1) {
+      form.append("images", new Blob([photoPng], { type: "image/png" }), `fixture-${index + 1}.png`);
+    }
+    return form;
   }
 
   const admissionInput = {
@@ -463,6 +649,16 @@ try {
   const unauthorizedUploadResponse = await request("POST", "/api/upload");
   assert.equal(unauthorizedUploadResponse.status, 401);
   assert.equal((await unauthorizedUploadResponse.json() as { code: string }).code, "AUTH_REQUIRED");
+
+  const unauthorizedPhotoCreateResponse = await requestForm("/api/photos", photoForm());
+  assert.equal(unauthorizedPhotoCreateResponse.status, 401);
+  assert.equal((await unauthorizedPhotoCreateResponse.json() as { code: string }).code, "AUTH_REQUIRED");
+  assert.equal((await integrationStorage.getPhotoAlbums()).length, 0);
+
+  const unauthorizedPhotoPatchResponse = await request("PATCH", "/api/photos/1", { title: "Unauthorized" });
+  assert.equal(unauthorizedPhotoPatchResponse.status, 401);
+  const unauthorizedPhotoDeleteResponse = await request("DELETE", "/api/photos/1");
+  assert.equal(unauthorizedPhotoDeleteResponse.status, 401);
 
   const noticeInput = {
     title: "Administrator notice integration test",
@@ -597,6 +793,16 @@ try {
   assert.equal(rejectedUploadOriginResponse.status, 403);
   assert.equal((await rejectedUploadOriginResponse.json() as { code: string }).code, "ORIGIN_REJECTED");
 
+  const rejectedPhotoOriginResponse = await requestForm(
+    "/api/photos",
+    photoForm("Cross-origin photo must not persist"),
+    "https://untrusted.example",
+    adminCookie,
+  );
+  assert.equal(rejectedPhotoOriginResponse.status, 403);
+  assert.equal((await rejectedPhotoOriginResponse.json() as { code: string }).code, "ORIGIN_REJECTED");
+  assert.equal((await integrationStorage.getPhotoAlbums()).length, 0);
+
   const noticeCreateResponse = await request("POST", "/api/notices", noticeInput, baseUrl, adminCookie);
   assert.equal(noticeCreateResponse.status, 201);
   const integrationNotice = await noticeCreateResponse.json() as { id: number };
@@ -686,7 +892,234 @@ try {
     adminCookie,
   )).status, 200);
   assert.equal(await integrationStorage.getPaper(integrationPaper.id), undefined);
+
+  const photoCreateResponse = await requestForm("/api/photos", photoForm(), baseUrl, adminCookie);
+  assert.equal(photoCreateResponse.status, 201);
+  const integrationPhoto = await photoCreateResponse.json() as {
+    id: number;
+    title: string;
+    imageCount: number;
+    coverImage: { id: number; url: string; downloadUrl: string; mimeType: string; altText: string };
+    images: Array<{ id: number; url: string; downloadUrl: string; mimeType: string; altText: string }>;
+  };
+  integrationPhotoAlbumId = integrationPhoto.id;
+  assert.equal(integrationPhoto.imageCount, 1);
+  assert.equal(integrationPhoto.images.length, 1);
+  assert.equal(integrationPhoto.images[0].mimeType, "image/webp");
+  assert.equal(integrationPhoto.images[0].altText, `${integrationPhoto.title} 사진 1`);
+  assert.equal("data" in integrationPhoto.images[0], false);
+  assert.equal(integrationPhoto.coverImage.url, `/api/photo-images/${integrationPhoto.images[0].id}`);
+  assert.equal(
+    integrationPhoto.coverImage.downloadUrl,
+    `/api/photo-images/${integrationPhoto.images[0].id}?download=1`,
+  );
+
+  const photoListResponse = await fetch(`${baseUrl}/api/photos`);
+  assert.equal(photoListResponse.status, 200);
+  const photoList = await photoListResponse.json() as Array<Record<string, unknown>>;
+  assert.equal(photoList.length, 1);
+  assert.equal("images" in photoList[0], false);
+  assert.equal(JSON.stringify(photoList).includes("image_data"), false);
+
+  const photoDetailResponse = await fetch(`${baseUrl}/api/photos/${integrationPhoto.id}`);
+  assert.equal(photoDetailResponse.status, 200);
+  assert.equal(JSON.stringify(await photoDetailResponse.json()).includes("image_data"), false);
+
+  const photoViewResponse = await request("PATCH", `/api/photos/${integrationPhoto.id}/views`);
+  assert.equal(photoViewResponse.status, 200);
+  assert.equal((await photoViewResponse.json() as { views: number }).views, 1);
+
+  const invalidPhotoDateResponse = await request(
+    "PATCH",
+    `/api/photos/${integrationPhoto.id}`,
+    { date: "2026-02-31" },
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(invalidPhotoDateResponse.status, 400);
+  const photoPatchResponse = await request(
+    "PATCH",
+    `/api/photos/${integrationPhoto.id}`,
+    { title: "Updated administrator photo album" },
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(photoPatchResponse.status, 200);
+
+  const firstPhotoId = integrationPhoto.images[0].id;
+  const imageResponse = await fetch(`${baseUrl}/api/photo-images/${firstPhotoId}`);
+  assert.equal(imageResponse.status, 200);
+  assert.equal(imageResponse.headers.get("ratelimit-limit"), "600");
+  assert.equal(imageResponse.headers.get("content-type"), "image/webp");
+  assert.match(imageResponse.headers.get("cache-control") ?? "", /no-cache/);
+  assert.equal((imageResponse.headers.get("cache-control") ?? "").includes("immutable"), false);
+  const optimizedImage = Buffer.from(await imageResponse.arrayBuffer());
+  assert.equal(optimizedImage.subarray(0, 4).toString("ascii"), "RIFF");
+  assert.equal(optimizedImage.subarray(8, 12).toString("ascii"), "WEBP");
+
+  const imageDownloadResponse = await fetch(`${baseUrl}/api/photo-images/${firstPhotoId}?download=1`);
+  assert.equal(imageDownloadResponse.status, 200);
+  assert.equal(imageDownloadResponse.headers.get("ratelimit-limit"), "60");
+  assert.match(imageDownloadResponse.headers.get("content-disposition") ?? "", /^attachment;/i);
+  assert.match(imageDownloadResponse.headers.get("cache-control") ?? "", /no-store/);
+  await imageDownloadResponse.arrayBuffer();
+
+  const addPhotoResponse = await requestForm(
+    `/api/photos/${integrationPhoto.id}/images`,
+    photoForm("ignored multipart metadata"),
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(addPhotoResponse.status, 201);
+  const photoWithTwoImages = await addPhotoResponse.json() as {
+    images: Array<{ id: number; sortOrder: number; altText: string }>;
+  };
+  assert.equal(photoWithTwoImages.images.length, 2);
+  const orderedIds = photoWithTwoImages.images.map(image => image.id).reverse();
+  const reorderPhotoResponse = await request(
+    "PATCH",
+    `/api/photos/${integrationPhoto.id}/images/order`,
+    { imageIds: orderedIds },
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(reorderPhotoResponse.status, 200);
+  const reorderedImages = (await reorderPhotoResponse.json() as {
+    images: Array<{ id: number; sortOrder: number; altText: string }>;
+  }).images;
+  assert.deepEqual(reorderedImages.map(image => image.id), orderedIds);
+  assert.deepEqual(reorderedImages.map(image => image.sortOrder), [0, 1]);
+  assert.equal(reorderedImages[0].altText, "Updated administrator photo album 사진 1");
+
+  const albumDownloadResponse = await fetch(`${baseUrl}/api/photos/${integrationPhoto.id}/download`);
+  assert.equal(albumDownloadResponse.status, 200);
+  assert.equal(albumDownloadResponse.headers.get("content-type"), "application/zip");
+  assert.match(albumDownloadResponse.headers.get("content-disposition") ?? "", /^attachment;/i);
+  const archiveBytes = Buffer.from(await albumDownloadResponse.arrayBuffer());
+  assert.equal(archiveBytes.subarray(0, 2).toString("ascii"), "PK");
+
+  const originalGetPhotoAlbumImages = integrationStorage.getPhotoAlbumImages.bind(integrationStorage);
+  let concurrentArchiveFetches = 0;
+  let completedArchiveFetches = 0;
+  let releaseArchiveFetches!: () => void;
+  const archiveFetchGate = new Promise<void>(resolve => { releaseArchiveFetches = resolve; });
+  integrationStorage.getPhotoAlbumImages = async id => {
+    concurrentArchiveFetches += 1;
+    await archiveFetchGate;
+    const images = await originalGetPhotoAlbumImages(id);
+    completedArchiveFetches += 1;
+    return images;
+  };
+  const firstArchiveController = new AbortController();
+  const secondArchiveController = new AbortController();
+  const firstConcurrentArchive = fetch(`${baseUrl}/api/photos/${integrationPhoto.id}/download`, {
+    signal: firstArchiveController.signal,
+  }).catch(error => error as Error);
+  const secondConcurrentArchive = fetch(`${baseUrl}/api/photos/${integrationPhoto.id}/download`, {
+    signal: secondArchiveController.signal,
+  }).catch(error => error as Error);
+  const rejectedArchiveController = new AbortController();
+  try {
+    for (let attempt = 0; attempt < 100 && concurrentArchiveFetches < 2; attempt += 1) {
+      await new Promise<void>(resolve => setTimeout(resolve, 5));
+    }
+    assert.equal(concurrentArchiveFetches, 2);
+    firstArchiveController.abort();
+    secondArchiveController.abort();
+    const rejectedConcurrentArchive = await Promise.race([
+      fetch(`${baseUrl}/api/photos/${integrationPhoto.id}/download`, {
+        signal: rejectedArchiveController.signal,
+      }),
+      new Promise<null>(resolve => setTimeout(() => resolve(null), 250)),
+    ]);
+    assert.ok(rejectedConcurrentArchive, "Aborted clients must not release archive slots before DB work ends");
+    assert.equal(rejectedConcurrentArchive.status, 429);
+    assert.equal((await rejectedConcurrentArchive.json() as { code: string }).code, "PHOTO_ARCHIVE_BUSY");
+  } finally {
+    rejectedArchiveController.abort();
+    releaseArchiveFetches();
+    integrationStorage.getPhotoAlbumImages = originalGetPhotoAlbumImages;
+  }
+  const abortedConcurrentArchives = await Promise.all([firstConcurrentArchive, secondConcurrentArchive]);
+  assert.ok(abortedConcurrentArchives.every(result => result instanceof Error));
+  for (let attempt = 0; attempt < 100 && completedArchiveFetches < 2; attempt += 1) {
+    await new Promise<void>(resolve => setTimeout(resolve, 5));
+  }
+  assert.equal(completedArchiveFetches, 2);
+  await new Promise<void>(resolve => setTimeout(resolve, 10));
+  const archiveAfterRelease = await fetch(`${baseUrl}/api/photos/${integrationPhoto.id}/download`);
+  assert.equal(archiveAfterRelease.status, 200);
+  await archiveAfterRelease.arrayBuffer();
+
+  assert.equal((await request(
+    "DELETE",
+    `/api/photo-images/${firstPhotoId}`,
+    undefined,
+    baseUrl,
+    adminCookie,
+  )).status, 200);
+  const remainingImageId = orderedIds.find(id => id !== firstPhotoId)!;
+  const lastPhotoDeleteResponse = await request(
+    "DELETE",
+    `/api/photo-images/${remainingImageId}`,
+    undefined,
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(lastPhotoDeleteResponse.status, 409);
+  assert.equal((await lastPhotoDeleteResponse.json() as { code: string }).code, "LAST_PHOTO_IMAGE_BLOCKED");
+
+  const fillPhotoAlbumResponse = await requestForm(
+    `/api/photos/${integrationPhoto.id}/images`,
+    photoImagesForm(11),
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(fillPhotoAlbumResponse.status, 201);
+  assert.equal((await fillPhotoAlbumResponse.json() as { imageCount: number }).imageCount, 12);
+  const thirteenthPhotoResponse = await requestForm(
+    `/api/photos/${integrationPhoto.id}/images`,
+    photoImagesForm(1),
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(thirteenthPhotoResponse.status, 400);
+  assert.equal((await thirteenthPhotoResponse.json() as { code: string }).code, "PHOTO_ALBUM_FULL");
+  assert.equal((await integrationStorage.getPhotoAlbum(integrationPhoto.id))?.images.length, 12);
+
+  const fullPhotoCreateResponse = await requestForm(
+    "/api/photos",
+    photoForm("Twelve-photo administrator integration test", 12),
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(fullPhotoCreateResponse.status, 201);
+  const fullPhotoAlbum = await fullPhotoCreateResponse.json() as { id: number; imageCount: number };
+  integrationFullPhotoAlbumId = fullPhotoAlbum.id;
+  assert.equal(fullPhotoAlbum.imageCount, 12);
+  assert.equal((await integrationStorage.getPhotoAlbum(fullPhotoAlbum.id))?.images.length, 12);
+  assert.equal((await request(
+    "DELETE",
+    `/api/photos/${fullPhotoAlbum.id}`,
+    undefined,
+    baseUrl,
+    adminCookie,
+  )).status, 200);
+  integrationFullPhotoAlbumId = null;
+
+  const photoDeleteResponse = await request(
+    "DELETE",
+    `/api/photos/${integrationPhoto.id}`,
+    undefined,
+    baseUrl,
+    adminCookie,
+  );
+  assert.equal(photoDeleteResponse.status, 200);
+  integrationPhotoAlbumId = null;
+  assert.equal((await fetch(`${baseUrl}/api/photo-images/${remainingImageId}`)).status, 404);
 } finally {
+  if (integrationFullPhotoAlbumId !== null) await integrationStorage.deletePhotoAlbum(integrationFullPhotoAlbumId);
+  if (integrationPhotoAlbumId !== null) await integrationStorage.deletePhotoAlbum(integrationPhotoAlbumId);
   if (integrationAdmissionId !== null) await integrationStorage.deleteAdmissionGuideline(integrationAdmissionId);
   if (integrationNoticeId !== null) await integrationStorage.deleteNotice(integrationNoticeId);
   if (integrationPaperId !== null) await integrationStorage.deletePaper(integrationPaperId);

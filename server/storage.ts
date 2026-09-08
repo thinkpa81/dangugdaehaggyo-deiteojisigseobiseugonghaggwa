@@ -1,14 +1,15 @@
-import { 
-  users, notices, papers, talents, noticeComments, paperComments, admissionGuidelines,
+import {
+  users, notices, papers, talents, noticeComments, paperComments, admissionGuidelines, photoAlbums, photoImages,
   type User, type InsertUser,
   type AdmissionGuideline, type InsertAdmissionGuideline,
+  type PhotoAlbum, type InsertPhotoAlbum, type PhotoImage,
   type Notice, type InsertNotice,
   type Paper, type InsertPaper,
   type Talent, type InsertTalent,
   type NoticeComment, type InsertNoticeComment,
   type PaperComment, type InsertPaperComment
 } from "@shared/schema";
-import { eq, desc, sql } from "drizzle-orm";
+import { asc, eq, desc, sql } from "drizzle-orm";
 import { isPasswordHash } from "./security";
 
 export type CreateAdminInput = {
@@ -26,6 +27,30 @@ export type AdminSummary = Pick<User,
 export type FirstAdminResult =
   | { status: "created"; admin: User }
   | { status: "already_exists" };
+
+export type StoredPhotoImageInput = Pick<PhotoImage,
+  "fileName" | "mimeType" | "byteSize" | "width" | "height" | "data"
+>;
+export type PhotoImageMetadata = Omit<PhotoImage, "data">;
+export type PhotoAlbumWithImages = {
+  album: PhotoAlbum;
+  images: PhotoImageMetadata[];
+};
+export type AddPhotoImagesResult =
+  | { status: "created"; album: PhotoAlbumWithImages }
+  | { status: "not_found" }
+  | { status: "album_full" }
+  | { status: "album_too_large" };
+export type ReorderPhotoImagesResult =
+  | { status: "updated"; album: PhotoAlbumWithImages }
+  | { status: "not_found" }
+  | { status: "invalid_order" };
+export type DeletePhotoImageResult = "deleted" | "not_found" | "last_image";
+
+function photoImageMetadata(image: PhotoImage): PhotoImageMetadata {
+  const { data: _data, ...metadata } = image;
+  return metadata;
+}
 
 function isUsableAdmin(user: User): boolean {
   return user.role.toLowerCase() === "admin"
@@ -52,6 +77,23 @@ export interface IStorage {
   updateAdmissionGuideline(id: number, guideline: Partial<InsertAdmissionGuideline>): Promise<AdmissionGuideline | undefined>;
   deleteAdmissionGuideline(id: number): Promise<void>;
   incrementAdmissionGuidelineViews(id: number): Promise<number | undefined>;
+
+  getPhotoAlbums(): Promise<PhotoAlbumWithImages[]>;
+  getPhotoAlbum(id: number): Promise<PhotoAlbumWithImages | undefined>;
+  getPhotoImage(id: number): Promise<PhotoImage | undefined>;
+  getPhotoAlbumImages(id: number): Promise<PhotoImage[]>;
+  createPhotoAlbum(album: InsertPhotoAlbum, images: StoredPhotoImageInput[]): Promise<PhotoAlbumWithImages>;
+  updatePhotoAlbum(id: number, album: Partial<InsertPhotoAlbum>): Promise<PhotoAlbumWithImages | undefined>;
+  incrementPhotoAlbumViews(id: number): Promise<number | undefined>;
+  addPhotoImages(
+    id: number,
+    images: StoredPhotoImageInput[],
+    maxAlbumBytes: number,
+    maxAlbumImages: number,
+  ): Promise<AddPhotoImagesResult>;
+  reorderPhotoImages(id: number, imageIds: number[]): Promise<ReorderPhotoImagesResult>;
+  deletePhotoImageSafely(id: number): Promise<DeletePhotoImageResult>;
+  deletePhotoAlbum(id: number): Promise<boolean>;
 
   getNotices(): Promise<Notice[]>;
   getNotice(id: number): Promise<Notice | undefined>;
@@ -240,7 +282,19 @@ export class MemoryStorage implements IStorage {
   private noticeComments: NoticeComment[] = [];
   private paperComments: PaperComment[] = [];
   private admissionGuidelines: AdmissionGuideline[] = [];
-  private nextId = { users: 1, notices: 5, papers: 7, talents: 1, noticeComments: 1, paperComments: 1, admissionGuidelines: 1 };
+  private photoAlbums: PhotoAlbum[] = [];
+  private photoImages: PhotoImage[] = [];
+  private nextId = {
+    users: 1,
+    notices: 5,
+    papers: 7,
+    talents: 1,
+    noticeComments: 1,
+    paperComments: 1,
+    admissionGuidelines: 1,
+    photoAlbums: 1,
+    photoImages: 1,
+  };
 
   async getUser(id: number): Promise<User | undefined> {
     return this.users.find(u => u.id === id);
@@ -352,6 +406,162 @@ export class MemoryStorage implements IStorage {
     if (!guideline) return undefined;
     guideline.views += 1;
     return guideline.views;
+  }
+
+  private photoAlbumWithImages(album: PhotoAlbum): PhotoAlbumWithImages {
+    return {
+      album: { ...album },
+      images: this.photoImages
+        .filter(image => image.albumId === album.id)
+        .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id)
+        .map(photoImageMetadata),
+    };
+  }
+
+  private resequencePhotoImages(album: PhotoAlbum, orderedImages: PhotoImage[]): void {
+    orderedImages.forEach((image, index) => {
+      image.sortOrder = index;
+      image.altText = `${album.title} 사진 ${index + 1}`;
+    });
+  }
+
+  async getPhotoAlbums(): Promise<PhotoAlbumWithImages[]> {
+    return [...this.photoAlbums]
+      .sort((a, b) => b.date.localeCompare(a.date) || b.id - a.id)
+      .map(album => this.photoAlbumWithImages(album));
+  }
+
+  async getPhotoAlbum(id: number): Promise<PhotoAlbumWithImages | undefined> {
+    const album = this.photoAlbums.find(item => item.id === id);
+    return album ? this.photoAlbumWithImages(album) : undefined;
+  }
+
+  async getPhotoImage(id: number): Promise<PhotoImage | undefined> {
+    const image = this.photoImages.find(item => item.id === id);
+    return image ? { ...image, data: Buffer.from(image.data) } : undefined;
+  }
+
+  async getPhotoAlbumImages(id: number): Promise<PhotoImage[]> {
+    return this.photoImages
+      .filter(image => image.albumId === id)
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id)
+      .map(image => ({ ...image, data: Buffer.from(image.data) }));
+  }
+
+  async createPhotoAlbum(album: InsertPhotoAlbum, images: StoredPhotoImageInput[]): Promise<PhotoAlbumWithImages> {
+    const now = new Date();
+    const created: PhotoAlbum = {
+      ...album,
+      id: this.nextId.photoAlbums++,
+      views: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.photoAlbums.push(created);
+    images.forEach((image, index) => {
+      this.photoImages.push({
+        ...image,
+        data: Buffer.from(image.data),
+        id: this.nextId.photoImages++,
+        albumId: created.id,
+        sortOrder: index,
+        altText: `${created.title} 사진 ${index + 1}`,
+        createdAt: now,
+      });
+    });
+    return this.photoAlbumWithImages(created);
+  }
+
+  async updatePhotoAlbum(id: number, album: Partial<InsertPhotoAlbum>): Promise<PhotoAlbumWithImages | undefined> {
+    const existing = this.photoAlbums.find(item => item.id === id);
+    if (!existing) return undefined;
+    Object.assign(existing, album, { updatedAt: new Date() });
+    if (album.title) {
+      const ordered = this.photoImages
+        .filter(image => image.albumId === id)
+        .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+      this.resequencePhotoImages(existing, ordered);
+    }
+    return this.photoAlbumWithImages(existing);
+  }
+
+  async incrementPhotoAlbumViews(id: number): Promise<number | undefined> {
+    const album = this.photoAlbums.find(item => item.id === id);
+    if (!album) return undefined;
+    album.views += 1;
+    return album.views;
+  }
+
+  async addPhotoImages(
+    id: number,
+    images: StoredPhotoImageInput[],
+    maxAlbumBytes: number,
+    maxAlbumImages: number,
+  ): Promise<AddPhotoImagesResult> {
+    const album = this.photoAlbums.find(item => item.id === id);
+    if (!album) return { status: "not_found" };
+    const existing = this.photoImages
+      .filter(image => image.albumId === id)
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+    if (existing.length + images.length > maxAlbumImages) return { status: "album_full" };
+    const totalBytes = existing.reduce((sum, image) => sum + image.byteSize, 0)
+      + images.reduce((sum, image) => sum + image.byteSize, 0);
+    if (totalBytes > maxAlbumBytes) return { status: "album_too_large" };
+
+    const now = new Date();
+    images.forEach((image, index) => {
+      this.photoImages.push({
+        ...image,
+        data: Buffer.from(image.data),
+        id: this.nextId.photoImages++,
+        albumId: id,
+        sortOrder: existing.length + index,
+        altText: `${album.title} 사진 ${existing.length + index + 1}`,
+        createdAt: now,
+      });
+    });
+    album.updatedAt = now;
+    return { status: "created", album: this.photoAlbumWithImages(album) };
+  }
+
+  async reorderPhotoImages(id: number, imageIds: number[]): Promise<ReorderPhotoImagesResult> {
+    const album = this.photoAlbums.find(item => item.id === id);
+    if (!album) return { status: "not_found" };
+    const existing = this.photoImages.filter(image => image.albumId === id);
+    const uniqueIds = new Set(imageIds);
+    if (uniqueIds.size !== imageIds.length
+      || imageIds.length !== existing.length
+      || existing.some(image => !uniqueIds.has(image.id))) {
+      return { status: "invalid_order" };
+    }
+    const byId = new Map(existing.map(image => [image.id, image]));
+    const ordered = imageIds.map(imageId => byId.get(imageId)!);
+    this.resequencePhotoImages(album, ordered);
+    album.updatedAt = new Date();
+    return { status: "updated", album: this.photoAlbumWithImages(album) };
+  }
+
+  async deletePhotoImageSafely(id: number): Promise<DeletePhotoImageResult> {
+    const image = this.photoImages.find(item => item.id === id);
+    if (!image) return "not_found";
+    const album = this.photoAlbums.find(item => item.id === image.albumId);
+    if (!album) return "not_found";
+    const albumImages = this.photoImages
+      .filter(item => item.albumId === image.albumId)
+      .sort((a, b) => a.sortOrder - b.sortOrder || a.id - b.id);
+    if (albumImages.length <= 1) return "last_image";
+    this.photoImages = this.photoImages.filter(item => item.id !== id);
+    this.resequencePhotoImages(album, albumImages.filter(item => item.id !== id));
+    album.updatedAt = new Date();
+    return "deleted";
+  }
+
+  async deletePhotoAlbum(id: number): Promise<boolean> {
+    const exists = this.photoAlbums.some(album => album.id === id);
+    if (!exists) return false;
+    this.photoAlbums = this.photoAlbums.filter(album => album.id !== id);
+    this.photoImages = this.photoImages.filter(image => image.albumId !== id);
+    return true;
   }
 
   async getNotices(): Promise<Notice[]> {
@@ -689,6 +899,249 @@ export class DatabaseStorage implements IStorage {
       .where(eq(admissionGuidelines.id, id))
       .returning({ views: admissionGuidelines.views });
     return updated?.views;
+  }
+
+  private async getPhotoImageMetadataForAlbum(executor: any, albumId: number): Promise<PhotoImageMetadata[]> {
+    return await executor
+      .select({
+        id: photoImages.id,
+        albumId: photoImages.albumId,
+        fileName: photoImages.fileName,
+        mimeType: photoImages.mimeType,
+        byteSize: photoImages.byteSize,
+        width: photoImages.width,
+        height: photoImages.height,
+        sortOrder: photoImages.sortOrder,
+        altText: photoImages.altText,
+        createdAt: photoImages.createdAt,
+      })
+      .from(photoImages)
+      .where(eq(photoImages.albumId, albumId))
+      .orderBy(asc(photoImages.sortOrder), asc(photoImages.id));
+  }
+
+  private async getPhotoAlbumWithImages(executor: any, id: number): Promise<PhotoAlbumWithImages | undefined> {
+    const [album] = await executor.select().from(photoAlbums).where(eq(photoAlbums.id, id));
+    if (!album) return undefined;
+    return {
+      album,
+      images: await this.getPhotoImageMetadataForAlbum(executor, id),
+    };
+  }
+
+  async getPhotoAlbums(): Promise<PhotoAlbumWithImages[]> {
+    const albums = await this.db
+      .select()
+      .from(photoAlbums)
+      .orderBy(desc(photoAlbums.date), desc(photoAlbums.id));
+    if (!albums.length) return [];
+
+    const metadata = await this.db
+      .select({
+        id: photoImages.id,
+        albumId: photoImages.albumId,
+        fileName: photoImages.fileName,
+        mimeType: photoImages.mimeType,
+        byteSize: photoImages.byteSize,
+        width: photoImages.width,
+        height: photoImages.height,
+        sortOrder: photoImages.sortOrder,
+        altText: photoImages.altText,
+        createdAt: photoImages.createdAt,
+      })
+      .from(photoImages)
+      .orderBy(asc(photoImages.albumId), asc(photoImages.sortOrder), asc(photoImages.id));
+    const imagesByAlbum = new Map<number, PhotoImageMetadata[]>();
+    metadata.forEach((image: PhotoImageMetadata) => {
+      const images = imagesByAlbum.get(image.albumId) ?? [];
+      images.push(image);
+      imagesByAlbum.set(image.albumId, images);
+    });
+    return albums.map((album: PhotoAlbum) => ({
+      album,
+      images: imagesByAlbum.get(album.id) ?? [],
+    }));
+  }
+
+  async getPhotoAlbum(id: number): Promise<PhotoAlbumWithImages | undefined> {
+    return await this.getPhotoAlbumWithImages(this.db, id);
+  }
+
+  async getPhotoImage(id: number): Promise<PhotoImage | undefined> {
+    const [image] = await this.db.select().from(photoImages).where(eq(photoImages.id, id));
+    return image || undefined;
+  }
+
+  async getPhotoAlbumImages(id: number): Promise<PhotoImage[]> {
+    return await this.db
+      .select()
+      .from(photoImages)
+      .where(eq(photoImages.albumId, id))
+      .orderBy(asc(photoImages.sortOrder), asc(photoImages.id));
+  }
+
+  async createPhotoAlbum(album: InsertPhotoAlbum, images: StoredPhotoImageInput[]): Promise<PhotoAlbumWithImages> {
+    return await this.db.transaction(async (transaction: any) => {
+      const [created] = await transaction
+        .insert(photoAlbums)
+        .values({ ...album, views: 0 })
+        .returning();
+      if (images.length) {
+        await transaction.insert(photoImages).values(images.map((image, index) => ({
+          ...image,
+          albumId: created.id,
+          sortOrder: index,
+          altText: `${created.title} 사진 ${index + 1}`,
+        })));
+      }
+      return (await this.getPhotoAlbumWithImages(transaction, created.id))!;
+    });
+  }
+
+  async updatePhotoAlbum(id: number, album: Partial<InsertPhotoAlbum>): Promise<PhotoAlbumWithImages | undefined> {
+    return await this.db.transaction(async (transaction: any) => {
+      await transaction.execute(sql`SELECT id FROM photo_albums WHERE id = ${id} FOR UPDATE`);
+      const [updated] = await transaction
+        .update(photoAlbums)
+        .set({ ...album, updatedAt: new Date() })
+        .where(eq(photoAlbums.id, id))
+        .returning();
+      if (!updated) return undefined;
+
+      if (album.title !== undefined) {
+        const images = await this.getPhotoImageMetadataForAlbum(transaction, id);
+        for (let index = 0; index < images.length; index += 1) {
+          const image = images[index];
+          await transaction
+            .update(photoImages)
+            .set({ altText: `${updated.title} 사진 ${index + 1}` })
+            .where(eq(photoImages.id, image.id));
+        }
+      }
+      return (await this.getPhotoAlbumWithImages(transaction, id))!;
+    });
+  }
+
+  async incrementPhotoAlbumViews(id: number): Promise<number | undefined> {
+    const [updated] = await this.db
+      .update(photoAlbums)
+      .set({ views: sql`${photoAlbums.views} + 1` })
+      .where(eq(photoAlbums.id, id))
+      .returning({ views: photoAlbums.views });
+    return updated?.views;
+  }
+
+  async addPhotoImages(
+    id: number,
+    images: StoredPhotoImageInput[],
+    maxAlbumBytes: number,
+    maxAlbumImages: number,
+  ): Promise<AddPhotoImagesResult> {
+    return await this.db.transaction(async (transaction: any) => {
+      await transaction.execute(sql`SELECT id FROM photo_albums WHERE id = ${id} FOR UPDATE`);
+      const [album] = await transaction.select().from(photoAlbums).where(eq(photoAlbums.id, id));
+      if (!album) return { status: "not_found" } as const;
+
+      const existing = await this.getPhotoImageMetadataForAlbum(transaction, id);
+      if (existing.length + images.length > maxAlbumImages) return { status: "album_full" } as const;
+      const totalBytes = existing.reduce((sum, image) => sum + image.byteSize, 0)
+        + images.reduce((sum, image) => sum + image.byteSize, 0);
+      if (totalBytes > maxAlbumBytes) return { status: "album_too_large" } as const;
+
+      if (images.length) {
+        await transaction.insert(photoImages).values(images.map((image, index) => ({
+          ...image,
+          albumId: id,
+          sortOrder: existing.length + index,
+          altText: `${album.title} 사진 ${existing.length + index + 1}`,
+        })));
+      }
+      await transaction
+        .update(photoAlbums)
+        .set({ updatedAt: new Date() })
+        .where(eq(photoAlbums.id, id));
+      return {
+        status: "created",
+        album: (await this.getPhotoAlbumWithImages(transaction, id))!,
+      } as const;
+    });
+  }
+
+  async reorderPhotoImages(id: number, imageIds: number[]): Promise<ReorderPhotoImagesResult> {
+    return await this.db.transaction(async (transaction: any) => {
+      await transaction.execute(sql`SELECT id FROM photo_albums WHERE id = ${id} FOR UPDATE`);
+      const [album] = await transaction.select().from(photoAlbums).where(eq(photoAlbums.id, id));
+      if (!album) return { status: "not_found" } as const;
+
+      const existing = await this.getPhotoImageMetadataForAlbum(transaction, id);
+      const requestedIds = new Set(imageIds);
+      if (requestedIds.size !== imageIds.length
+        || imageIds.length !== existing.length
+        || existing.some(image => !requestedIds.has(image.id))) {
+        return { status: "invalid_order" } as const;
+      }
+
+      await transaction
+        .update(photoImages)
+        .set({ sortOrder: sql`${photoImages.sortOrder} + 1000000` })
+        .where(eq(photoImages.albumId, id));
+      for (let index = 0; index < imageIds.length; index += 1) {
+        const imageId = imageIds[index];
+        await transaction
+          .update(photoImages)
+          .set({ sortOrder: index, altText: `${album.title} 사진 ${index + 1}` })
+          .where(eq(photoImages.id, imageId));
+      }
+      await transaction
+        .update(photoAlbums)
+        .set({ updatedAt: new Date() })
+        .where(eq(photoAlbums.id, id));
+      return {
+        status: "updated",
+        album: (await this.getPhotoAlbumWithImages(transaction, id))!,
+      } as const;
+    });
+  }
+
+  async deletePhotoImageSafely(id: number): Promise<DeletePhotoImageResult> {
+    return await this.db.transaction(async (transaction: any) => {
+      const [candidate] = await transaction.select().from(photoImages).where(eq(photoImages.id, id));
+      if (!candidate) return "not_found";
+
+      await transaction.execute(sql`SELECT id FROM photo_albums WHERE id = ${candidate.albumId} FOR UPDATE`);
+      const [album] = await transaction.select().from(photoAlbums).where(eq(photoAlbums.id, candidate.albumId));
+      if (!album) return "not_found";
+      const existing = await this.getPhotoImageMetadataForAlbum(transaction, album.id);
+      if (existing.length <= 1) return "last_image";
+
+      const [deleted] = await transaction
+        .delete(photoImages)
+        .where(eq(photoImages.id, id))
+        .returning({ id: photoImages.id });
+      if (!deleted) return "not_found";
+
+      const remaining = existing.filter(image => image.id !== id);
+      for (let index = 0; index < remaining.length; index += 1) {
+        const image = remaining[index];
+        await transaction
+          .update(photoImages)
+          .set({ sortOrder: index, altText: `${album.title} 사진 ${index + 1}` })
+          .where(eq(photoImages.id, image.id));
+      }
+      await transaction
+        .update(photoAlbums)
+        .set({ updatedAt: new Date() })
+        .where(eq(photoAlbums.id, album.id));
+      return "deleted";
+    });
+  }
+
+  async deletePhotoAlbum(id: number): Promise<boolean> {
+    const [deleted] = await this.db
+      .delete(photoAlbums)
+      .where(eq(photoAlbums.id, id))
+      .returning({ id: photoAlbums.id });
+    return Boolean(deleted);
   }
 
   async getNotices(): Promise<Notice[]> {

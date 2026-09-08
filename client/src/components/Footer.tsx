@@ -67,6 +67,24 @@ export default function Footer() {
                   입학안내 · 모집요강
                 </Link>
               </li>
+              <li>
+                <Link href="/photos" className="hover:text-blue-400 transition-colors flex items-center gap-2 group" data-testid="footer-link-photos">
+                  <span className="w-1 h-1 bg-blue-500 rounded-full group-hover:w-2 transition-all" />
+                  사진자료실
+                </Link>
+              </li>
+              <li>
+                <a
+                  href="https://drive.google.com/drive/folders/1WoLoXcT7wRbpyxldRxXyyMKYTuZR0k4L?usp=drive_link"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:text-blue-400 transition-colors flex items-center gap-2 group"
+                  data-testid="footer-link-shared-resources"
+                >
+                  <span className="w-1 h-1 bg-blue-500 rounded-full group-hover:w-2 transition-all" />
+                  공유자료실 <ExternalLink className="h-3 w-3" />
+                </a>
+              </li>
             </ul>
           </div>
 

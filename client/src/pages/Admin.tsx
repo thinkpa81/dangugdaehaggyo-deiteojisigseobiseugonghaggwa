@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Bell, BookOpen, ClipboardList, KeyRound, LockKeyhole, Plus, ShieldCheck, Trash2, UserCog } from "lucide-react";
+import { Bell, BookOpen, ClipboardList, Images, KeyRound, LockKeyhole, Plus, ShieldCheck, Trash2, UserCog } from "lucide-react";
 import { Link } from "wouter";
 import Header from "@/components/Header";
 import Footer from "@/components/Footer";
@@ -255,7 +255,7 @@ export default function Admin() {
             <div className="space-y-8">
               <section aria-labelledby="content-management-heading">
                 <h2 id="content-management-heading" className="mb-4 text-xl font-black text-slate-900">콘텐츠 관리</h2>
-                <div className="grid gap-4 sm:grid-cols-3">
+                <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                   <Button variant="outline" asChild className="h-auto min-h-24 justify-start rounded-xl border-slate-200 bg-white p-5 text-left shadow-sm hover:border-blue-200 hover:bg-blue-50/40">
                     <Link href="/notices"><Bell className="mr-3 h-5 w-5 shrink-0 text-[#2156D9]" aria-hidden="true" /><span><strong className="block text-base text-slate-900">공지사항</strong><span className="mt-1 block text-sm font-normal text-slate-500">등록·수정·삭제</span></span></Link>
                   </Button>
@@ -264,6 +264,9 @@ export default function Admin() {
                   </Button>
                   <Button variant="outline" asChild className="h-auto min-h-24 justify-start rounded-xl border-slate-200 bg-white p-5 text-left shadow-sm hover:border-blue-200 hover:bg-blue-50/40">
                     <Link href="/admissions/guidelines"><ClipboardList className="mr-3 h-5 w-5 shrink-0 text-[#2156D9]" aria-hidden="true" /><span><strong className="block text-base text-slate-900">입학안내 · 모집요강</strong><span className="mt-1 block text-sm font-normal text-slate-500">등록·수정·삭제</span></span></Link>
+                  </Button>
+                  <Button variant="outline" asChild className="h-auto min-h-24 justify-start rounded-xl border-slate-200 bg-white p-5 text-left shadow-sm hover:border-blue-200 hover:bg-blue-50/40">
+                    <Link href="/photos"><Images className="mr-3 h-5 w-5 shrink-0 text-[#2156D9]" aria-hidden="true" /><span><strong className="block text-base text-slate-900">사진자료실</strong><span className="mt-1 block text-sm font-normal text-slate-500">등록·수정·삭제</span></span></Link>
                   </Button>
                 </div>
               </section>
